@@ -1,0 +1,11 @@
+# Coucou's own per-project state directory
+.coucou/
+
+# Go build artifacts
+/coucou
+*.exe
+*.test
+*.out
+
+# macOS
+.DS_Store
