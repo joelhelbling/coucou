@@ -196,9 +196,10 @@ asleep — each task decides for itself:
 ### State
 
 Per-project state lives in `.coucou/` beside the config (override with
-`state_dir:`). It holds last-run times, the last twelve outcomes per task, the
-disabled flags set with `d`, and the instance lock. **Coucou never writes to
-your config file.** Add `.coucou/` to `.gitignore`.
+`state_dir:`). It holds `state.json` (last-run times, the last twelve outcomes
+per task, the disabled flags set with `d`), the instance `lock`, and
+`lock.mutex`, a zero-length file used to serialize lock acquisition. **Coucou
+never writes to your config file.** Add `.coucou/` to `.gitignore`.
 
 Only one Coucou may schedule a given config at a time — a second one would
 mean every task fires twice — so launching another exits non-zero and names
