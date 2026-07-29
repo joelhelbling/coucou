@@ -2193,12 +2193,17 @@ func TestRunTimesOutAndKillsStubbornChild(t *testing.T) {
 }
 
 func TestRunKillsGrandchildren(t *testing.T) {
-	cfg, task := fixture(t, config.Task{Name: "family", Command: "sleep 30 & wait"})
-	dir := cfg.Dir
-	markerCmd := "sh -c 'sleep 30; echo alive > " + filepath.Join(dir, "marker") + "' & wait"
-	cfg.Tasks[0].Command = markerCmd
-	cfg.Tasks[0].Timeout = config.Duration(200 * time.Millisecond)
-	task = &cfg.Tasks[0]
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	// The shell backgrounds a grandchild that would write the marker after a
+	// delay. Killing only the direct child would leave it alive to write.
+	cfg := &config.Config{Dir: dir, Tasks: []config.Task{{
+		Name:    "family",
+		Shell:   "/bin/sh",
+		Command: "sh -c 'sleep 30; echo alive > " + marker + "' & wait",
+		Timeout: config.Duration(200 * time.Millisecond),
+	}}}
+	task := &cfg.Tasks[0]
 
 	res := New(300 * time.Millisecond).Run(context.Background(), cfg, task)
 	if res.Outcome != OutcomeTimeout {
@@ -2207,7 +2212,7 @@ func TestRunKillsGrandchildren(t *testing.T) {
 
 	// Give any survivor time to write its marker.
 	time.Sleep(500 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(dir, "marker")); err == nil {
+	if _, err := os.Stat(marker); err == nil {
 		t.Error("grandchild survived; the whole process group must be killed")
 	}
 }
@@ -2347,7 +2352,14 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 
 	pgid := cmd.Process.Pid
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	// exited is closed when the child has been reaped. terminateGroup
+	// watches it so escalation stops as soon as the process is gone,
+	// without consuming the value the caller reads from done.
+	exited := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(exited)
+	}()
 
 	var timeout <-chan time.Time
 	if d := t.Timeout.Std(); d > 0 {
@@ -2361,10 +2373,10 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 	case err = <-done:
 	case <-timeout:
 		timedOut = true
-		terminateGroup(pgid, r.grace)
+		terminateGroup(pgid, r.grace, exited)
 		err = <-done
 	case <-ctx.Done():
-		terminateGroup(pgid, r.grace)
+		terminateGroup(pgid, r.grace, exited)
 		err = <-done
 		res.FinishedAt = time.Now()
 		res.Outcome = OutcomeReplaced
@@ -2388,17 +2400,25 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 	return res
 }
 
-// terminateGroup signals the whole process group: SIGTERM, then SIGKILL
-// after the grace period.
+// terminateGroup signals the whole process group: SIGTERM, then SIGKILL if
+// it has not exited within the grace period.
 //
-// It deliberately does NOT watch the done channel. Only the caller receives
-// from done, so a helper that consumed the value would deadlock the caller.
-// Sending SIGKILL to a group that has already exited simply returns an error
-// we ignore, so waiting out the full grace period is harmless.
-func terminateGroup(pgid int, grace time.Duration) {
+// It watches `exited` rather than `done`: only the caller receives from
+// done, and a helper that consumed that value would deadlock the caller.
+// Returning as soon as the child is reaped matters — sleeping out the full
+// grace period would inflate every timed-out run's recorded duration by up
+// to the grace period.
+func terminateGroup(pgid int, grace time.Duration, exited <-chan struct{}) {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	time.Sleep(grace)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case <-exited:
+		return
+	case <-timer.C:
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
 }
 
 func exitCode(err error) int {
@@ -3917,15 +3937,34 @@ func TestListPrintsTasks(t *testing.T) {
 }
 
 func TestNextPrintsSoonest(t *testing.T) {
-	dir := project(t, goodConfig)
+	// A single task makes the answer deterministic regardless of the wall
+	// clock: with two tasks, which one is soonest depends on the time of day.
+	dir := project(t, `
+tasks:
+  - name: only one
+    command: "true"
+    schedule: "@every 30m"
+`)
 	code, out, errOut := run(t, dir, "next")
 	if code != 0 {
 		t.Fatalf("exit %d (stderr: %s)", code, errOut)
 	}
-	// "poll" runs every 30m, so it is always sooner than a daily 17:00 task
-	// unless the clock is within 30 minutes of 17:00. Assert on shape only.
-	if !strings.Contains(out, "xkcd") && !strings.Contains(out, "poll") {
-		t.Errorf("output should name a task:\n%s", out)
+	if !strings.Contains(out, "only one") {
+		t.Errorf("output should name the task:\n%s", out)
+	}
+	if !strings.Contains(out, "in ") {
+		t.Errorf("output should include a countdown:\n%s", out)
+	}
+}
+
+func TestNextWithNoTasks(t *testing.T) {
+	dir := project(t, "tasks: []\n")
+	code, out, _ := run(t, dir, "next")
+	if code != 0 {
+		t.Errorf("exit %d, want 0", code)
+	}
+	if !strings.Contains(out, "no tasks") {
+		t.Errorf("output should say there is nothing scheduled:\n%s", out)
 	}
 }
 
