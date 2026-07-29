@@ -818,20 +818,32 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+// Human is built from parsed intent, never inferred by sampling
+// occurrences. Assert exact strings: substring matching was too loose to
+// catch "0 9 * * 1-5" being described as "at 09:00 every day".
 func TestHuman(t *testing.T) {
-	tests := []struct{ expr, contains string }{
-		{"@daily at 17:00", "17:00"},
-		{"@weekly on mon at 18:30", "Monday"},
-		{"@every 90s", "1m30s"},
+	tests := []struct{ expr, want string }{
+		{"@hourly", "at :00 every hour"},
+		{"@hourly at :15", "at :15 every hour"},
+		{"@daily", "at 00:00 every day"},
+		{"@daily at 17:00", "at 17:00 every day"},
+		{"@weekly", "at 00:00 every Sunday"},
+		{"@weekly on mon at 18:30", "at 18:30 every Monday"},
+		{"@monthly on 1 at 09:00", "at 09:00 on day 1 of every month"},
+		{"@every 90s", "every 1m30s"},
+
+		// Raw cron carries no intent to describe, so it is shown verbatim
+		// rather than guessed at.
+		{"30 18 * * 1", "30 18 * * 1"},
+		{"0 9 * * 1-5", "0 9 * * 1-5"},
 	}
 	for _, tc := range tests {
 		s, err := Parse(tc.expr)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", tc.expr, err)
 		}
-		if !strings.Contains(s.Human(), tc.contains) {
-			t.Errorf("Human() for %q = %q, want it to contain %q",
-				tc.expr, s.Human(), tc.contains)
+		if got := s.Human(); got != tc.want {
+			t.Errorf("Human() for %q = %q, want %q", tc.expr, got, tc.want)
 		}
 	}
 }
@@ -853,22 +865,27 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // expandMacro converts a macro expression such as "@weekly on mon at 18:30"
-// into the equivalent five-field cron expression. It returns ok=false when
-// expr is not a macro at all, so the caller can try other forms.
-func expandMacro(expr string) (cron string, ok bool, err error) {
+// into the equivalent five-field cron expression AND the English
+// description that macro carries. It returns ok=false when expr is not a
+// macro at all, so the caller can try other forms.
+//
+// The description is produced here, from the parsed intent, rather than
+// inferred later by sampling occurrences — see cronSchedule.Human.
+func expandMacro(expr string) (cron, human string, ok bool, err error) {
 	fields := strings.Fields(expr)
 	if len(fields) == 0 || !strings.HasPrefix(fields[0], "@") {
-		return "", false, nil
+		return "", "", false, nil
 	}
 
 	macro := strings.ToLower(fields[0])
 	switch macro {
 	case "@hourly", "@daily", "@weekly", "@monthly":
 	default:
-		return "", true, fmt.Errorf("unknown macro %q "+
+		return "", "", true, fmt.Errorf("unknown macro %q "+
 			"(expected @hourly, @daily, @weekly, @monthly or @every)", macro)
 	}
 
@@ -878,16 +895,16 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 		switch strings.ToLower(rest[0]) {
 		case "on":
 			if len(rest) < 2 {
-				return "", true, fmt.Errorf("%q: 'on' needs a value", expr)
+				return "", "", true, fmt.Errorf("%q: 'on' needs a value", expr)
 			}
 			onArg, rest = rest[1], rest[2:]
 		case "at":
 			if len(rest) < 2 {
-				return "", true, fmt.Errorf("%q: 'at' needs a value", expr)
+				return "", "", true, fmt.Errorf("%q: 'at' needs a value", expr)
 			}
 			atArg, rest = rest[1], rest[2:]
 		default:
-			return "", true, fmt.Errorf("%q: unexpected %q "+
+			return "", "", true, fmt.Errorf("%q: unexpected %q "+
 				"(expected 'on' or 'at')", expr, rest[0])
 		}
 	}
@@ -898,35 +915,37 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 	switch macro {
 	case "@hourly":
 		if onArg != "" {
-			return "", true, fmt.Errorf("@hourly does not take 'on'")
+			return "", "", true, fmt.Errorf("@hourly does not take 'on'")
 		}
 		if atArg != "" {
 			m, err := parseMinuteOfHour(atArg)
 			if err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 			minute = m
 		}
-		return fmt.Sprintf("%d * * * *", minute), true, nil
+		return fmt.Sprintf("%d * * * *", minute),
+			fmt.Sprintf("at :%02d every hour", minute), true, nil
 
 	case "@daily":
 		if onArg != "" {
-			return "", true, fmt.Errorf("@daily does not take 'on'")
+			return "", "", true, fmt.Errorf("@daily does not take 'on'")
 		}
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d * * *", minute, hour), true, nil
+		return fmt.Sprintf("%d %d * * *", minute, hour),
+			fmt.Sprintf("at %02d:%02d every day", hour, minute), true, nil
 
 	case "@weekly":
 		dow := 0 // Sunday
 		if onArg != "" {
 			d, ok := dayNames[strings.ToLower(onArg)]
 			if !ok {
-				return "", true, fmt.Errorf("%q is not a day name "+
+				return "", "", true, fmt.Errorf("%q is not a day name "+
 					"(expected sun, mon, tue, wed, thu, fri or sat)", onArg)
 			}
 			dow = d
@@ -934,29 +953,31 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d * * %d", minute, hour, dow), true, nil
+		return fmt.Sprintf("%d %d * * %d", minute, hour, dow),
+			fmt.Sprintf("at %02d:%02d every %s", hour, minute, time.Weekday(dow)), true, nil
 
 	case "@monthly":
 		dom := 1
 		if onArg != "" {
 			d, err := strconv.Atoi(onArg)
 			if err != nil || d < 1 || d > 31 {
-				return "", true, fmt.Errorf("%q is not a day of month 1-31", onArg)
+				return "", "", true, fmt.Errorf("%q is not a day of month 1-31", onArg)
 			}
 			dom = d
 		}
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d %d * *", minute, hour, dom), true, nil
+		return fmt.Sprintf("%d %d %d * *", minute, hour, dom),
+			fmt.Sprintf("at %02d:%02d on day %d of every month", hour, minute, dom), true, nil
 	}
-	return "", true, fmt.Errorf("unhandled macro %q", macro)
+	return "", "", true, fmt.Errorf("unhandled macro %q", macro)
 }
 
 // parseTimeOfDay parses "17:00".
@@ -1030,7 +1051,7 @@ func Parse(expr string) (Schedule, error) {
 		return parseInterval(trimmed)
 	}
 
-	if cronExpr, isMacro, err := expandMacro(trimmed); isMacro {
+	if cronExpr, human, isMacro, err := expandMacro(trimmed); isMacro {
 		if err != nil {
 			return nil, err
 		}
@@ -1038,7 +1059,7 @@ func Parse(expr string) (Schedule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%q expanded to %q: %w", trimmed, cronExpr, err)
 		}
-		return &cronSchedule{spec: spec, source: trimmed}, nil
+		return &cronSchedule{spec: spec, source: trimmed, human: human}, nil
 	}
 
 	spec, err := ParseCron(trimmed)
@@ -1066,33 +1087,28 @@ func parseInterval(expr string) (Schedule, error) {
 type cronSchedule struct {
 	spec   *CronSpec
 	source string
+	// human is the description a macro carried from parse time. Empty for
+	// raw cron, which is shown verbatim.
+	human string
 }
 
 func (c *cronSchedule) Next(_ , now time.Time) time.Time { return c.spec.Next(now) }
 func (c *cronSchedule) Kind() Kind                       { return KindCron }
 func (c *cronSchedule) String() string                   { return c.source }
 
+// Human returns the description the macro carried from parse time. Raw cron
+// gets no translation and returns its expression verbatim.
+//
+// Deliberately NOT inferred by sampling occurrences. A sampling heuristic
+// reports "at 09:00 every day" for "0 9 * * 1-5" whenever the first two
+// occurrences happen to fall on consecutive weekdays, and a third sample
+// does not help — Mon/Tue/Wed are 24h apart too. A confidently wrong
+// description is worse than none.
 func (c *cronSchedule) Human() string {
-	// Describe the expanded spec by sampling it: this keeps the description
-	// honest for both raw cron and macros without a second grammar.
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	first := c.spec.Next(base)
-	if first.IsZero() {
+	if c.human == "" {
 		return c.source
 	}
-	second := c.spec.Next(first)
-
-	timeOfDay := first.Format("15:04")
-	switch {
-	case !second.IsZero() && second.Sub(first) == 24*time.Hour:
-		return fmt.Sprintf("at %s every day", timeOfDay)
-	case !second.IsZero() && second.Sub(first) == 7*24*time.Hour:
-		return fmt.Sprintf("at %s every %s", timeOfDay, first.Weekday())
-	case !second.IsZero() && second.Sub(first) == time.Hour:
-		return fmt.Sprintf("at :%02d every hour", first.Minute())
-	default:
-		return c.source
-	}
+	return c.human
 }
 
 type intervalSchedule struct {
@@ -2193,12 +2209,17 @@ func TestRunTimesOutAndKillsStubbornChild(t *testing.T) {
 }
 
 func TestRunKillsGrandchildren(t *testing.T) {
-	cfg, task := fixture(t, config.Task{Name: "family", Command: "sleep 30 & wait"})
-	dir := cfg.Dir
-	markerCmd := "sh -c 'sleep 30; echo alive > " + filepath.Join(dir, "marker") + "' & wait"
-	cfg.Tasks[0].Command = markerCmd
-	cfg.Tasks[0].Timeout = config.Duration(200 * time.Millisecond)
-	task = &cfg.Tasks[0]
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	// The shell backgrounds a grandchild that would write the marker after a
+	// delay. Killing only the direct child would leave it alive to write.
+	cfg := &config.Config{Dir: dir, Tasks: []config.Task{{
+		Name:    "family",
+		Shell:   "/bin/sh",
+		Command: "sh -c 'sleep 30; echo alive > " + marker + "' & wait",
+		Timeout: config.Duration(200 * time.Millisecond),
+	}}}
+	task := &cfg.Tasks[0]
 
 	res := New(300 * time.Millisecond).Run(context.Background(), cfg, task)
 	if res.Outcome != OutcomeTimeout {
@@ -2207,7 +2228,7 @@ func TestRunKillsGrandchildren(t *testing.T) {
 
 	// Give any survivor time to write its marker.
 	time.Sleep(500 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(dir, "marker")); err == nil {
+	if _, err := os.Stat(marker); err == nil {
 		t.Error("grandchild survived; the whole process group must be killed")
 	}
 }
@@ -2347,7 +2368,14 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 
 	pgid := cmd.Process.Pid
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	// exited is closed when the child has been reaped. terminateGroup
+	// watches it so escalation stops as soon as the process is gone,
+	// without consuming the value the caller reads from done.
+	exited := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(exited)
+	}()
 
 	var timeout <-chan time.Time
 	if d := t.Timeout.Std(); d > 0 {
@@ -2361,10 +2389,10 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 	case err = <-done:
 	case <-timeout:
 		timedOut = true
-		terminateGroup(pgid, r.grace)
+		terminateGroup(pgid, r.grace, exited)
 		err = <-done
 	case <-ctx.Done():
-		terminateGroup(pgid, r.grace)
+		terminateGroup(pgid, r.grace, exited)
 		err = <-done
 		res.FinishedAt = time.Now()
 		res.Outcome = OutcomeReplaced
@@ -2388,17 +2416,25 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 	return res
 }
 
-// terminateGroup signals the whole process group: SIGTERM, then SIGKILL
-// after the grace period.
+// terminateGroup signals the whole process group: SIGTERM, then SIGKILL if
+// it has not exited within the grace period.
 //
-// It deliberately does NOT watch the done channel. Only the caller receives
-// from done, so a helper that consumed the value would deadlock the caller.
-// Sending SIGKILL to a group that has already exited simply returns an error
-// we ignore, so waiting out the full grace period is harmless.
-func terminateGroup(pgid int, grace time.Duration) {
+// It watches `exited` rather than `done`: only the caller receives from
+// done, and a helper that consumed that value would deadlock the caller.
+// Returning as soon as the child is reaped matters — sleeping out the full
+// grace period would inflate every timed-out run's recorded duration by up
+// to the grace period.
+func terminateGroup(pgid int, grace time.Duration, exited <-chan struct{}) {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	time.Sleep(grace)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case <-exited:
+		return
+	case <-timer.C:
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
 }
 
 func exitCode(err error) int {
@@ -3917,15 +3953,34 @@ func TestListPrintsTasks(t *testing.T) {
 }
 
 func TestNextPrintsSoonest(t *testing.T) {
-	dir := project(t, goodConfig)
+	// A single task makes the answer deterministic regardless of the wall
+	// clock: with two tasks, which one is soonest depends on the time of day.
+	dir := project(t, `
+tasks:
+  - name: only one
+    command: "true"
+    schedule: "@every 30m"
+`)
 	code, out, errOut := run(t, dir, "next")
 	if code != 0 {
 		t.Fatalf("exit %d (stderr: %s)", code, errOut)
 	}
-	// "poll" runs every 30m, so it is always sooner than a daily 17:00 task
-	// unless the clock is within 30 minutes of 17:00. Assert on shape only.
-	if !strings.Contains(out, "xkcd") && !strings.Contains(out, "poll") {
-		t.Errorf("output should name a task:\n%s", out)
+	if !strings.Contains(out, "only one") {
+		t.Errorf("output should name the task:\n%s", out)
+	}
+	if !strings.Contains(out, "in ") {
+		t.Errorf("output should include a countdown:\n%s", out)
+	}
+}
+
+func TestNextWithNoTasks(t *testing.T) {
+	dir := project(t, "tasks: []\n")
+	code, out, _ := run(t, dir, "next")
+	if code != 0 {
+		t.Errorf("exit %d, want 0", code)
+	}
+	if !strings.Contains(out, "no tasks") {
+		t.Errorf("output should say there is nothing scheduled:\n%s", out)
 	}
 }
 

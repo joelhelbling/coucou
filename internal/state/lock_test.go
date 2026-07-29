@@ -1,0 +1,474 @@
+package state
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestAcquireAndRelease(t *testing.T) {
+	dir := t.TempDir()
+
+	l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	if l.PID != os.Getpid() {
+		t.Errorf("PID = %d, want %d", l.PID, os.Getpid())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lock")); err != nil {
+		t.Errorf("lock file not created: %v", err)
+	}
+
+	if err := l.Release(); err != nil {
+		t.Errorf("Release: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock file should be removed on release")
+	}
+}
+
+func TestAcquireRefusesWhenHeldByLiveProcess(t *testing.T) {
+	dir := t.TempDir()
+	first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+
+	_, err = AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err == nil {
+		t.Fatal("expected the second acquisition to fail")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(os.Getpid())) {
+		t.Errorf("error %q should name the holding pid", err)
+	}
+}
+
+func TestAcquireBreaksStaleLock(t *testing.T) {
+	dir := t.TempDir()
+
+	// A process that has certainly exited.
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := cmd.Process.Pid
+
+	body := `{"pid": ` + strconv.Itoa(deadPID) +
+		`, "started_at": "2026-07-29T14:00:00Z", "config_path": "/proj/.coucou.yaml"}`
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatalf("a lock held by a dead pid must be broken automatically: %v", err)
+	}
+	defer l.Release()
+}
+
+func TestAcquireBreaksCorruptLock(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatalf("a corrupt lock should be treated as stale: %v", err)
+	}
+	defer l.Release()
+}
+
+func TestAcquireForceBreaksLiveLock(t *testing.T) {
+	dir := t.TempDir()
+	first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+
+	second, err := AcquireLock(dir, "/proj/.coucou.yaml", true)
+	if err != nil {
+		t.Fatalf("force should break a live lock: %v", err)
+	}
+	defer second.Release()
+}
+
+// TestReleaseDoesNotDeleteAnotherHoldersLock is the regression test for the
+// critical finding: Release must not delete a lock it no longer owns.
+//
+// Sequence: process A acquires the lock, process B force-acquires it
+// (overwriting A's lock file and becoming the legitimate holder), and A
+// later calls Release on its now-stale in-memory *Lock. That must be a
+// no-op: the lock file must survive, and it must still name B's token.
+func TestReleaseDoesNotDeleteAnotherHoldersLock(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireLock(dir, "/proj/.coucou.yaml", true)
+	if err != nil {
+		t.Fatalf("force acquire: %v", err)
+	}
+	defer second.Release()
+
+	if err := first.Release(); err != nil {
+		t.Errorf("Release of a superseded lock must return nil, got: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "lock")); err != nil {
+		t.Fatalf("lock file should still exist after the superseded holder releases: %v", err)
+	}
+	onDisk, ok := readLock(filepath.Join(dir, "lock"))
+	if !ok {
+		t.Fatal("lock file should still be readable")
+	}
+	if onDisk.token != second.token {
+		t.Error("lock file should still name the second holder's token")
+	}
+}
+
+func TestReleaseLeavesUnparseableLockFileInPlace(t *testing.T) {
+	dir := t.TempDir()
+
+	l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "lock")
+	if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.Release(); err != nil {
+		t.Errorf("Release on an unparseable lock file must return nil, got: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("lock file should still exist: %v", err)
+	}
+	if string(data) != "garbage" {
+		t.Error("Release must not modify a lock file it cannot parse")
+	}
+}
+
+func TestReleaseOrdinaryPathRemovesFile(t *testing.T) {
+	dir := t.TempDir()
+
+	l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Release(); err != nil {
+		t.Errorf("Release: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock file should be removed when the current holder releases it")
+	}
+}
+
+// TestAcquireRetryDoesNotStompLiveLock guards the O_EXCL retry path added to
+// fix the TOCTOU race: an exclusive create that loses to a file already on
+// disk must inspect that file's liveness before ever removing it. A live
+// holder must still cause a non-force acquire to fail, exactly as before.
+func TestAcquireRetryDoesNotStompLiveLock(t *testing.T) {
+	dir := t.TempDir()
+	first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+
+	_, err = AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err == nil {
+		t.Fatal("expected the second acquisition to fail")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(os.Getpid())) {
+		t.Errorf("error %q should name the holding pid", err)
+	}
+
+	// The live lock must still be intact and owned by the first holder.
+	onDisk, ok := readLock(filepath.Join(dir, "lock"))
+	if !ok {
+		t.Fatal("lock file should still be readable")
+	}
+	if onDisk.token != first.token {
+		t.Error("a failed non-force acquire must not disturb the live lock")
+	}
+}
+
+func TestAcquireLockGeneratesDistinctTokens(t *testing.T) {
+	dir1, dir2 := t.TempDir(), t.TempDir()
+
+	l1, err := AcquireLock(dir1, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1.Release()
+
+	l2, err := AcquireLock(dir2, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Release()
+
+	if l1.token == "" || l2.token == "" {
+		t.Fatal("tokens should not be empty")
+	}
+	if l1.token == l2.token {
+		t.Error("two AcquireLock calls should produce different tokens")
+	}
+}
+
+// TestConcurrentAcquireHasExactlyOneWinner is the regression test for the
+// atomicity fix: AcquireLock must never let the lock file be observable in a
+// half-written state. Under the old O_CREATE|O_EXCL approach, a losing
+// acquirer could open the winner's file before its payload was written,
+// find it empty and therefore unparseable, and conclude it was stale -
+// deleting the winner's live lock and taking over itself. With N goroutines
+// racing to acquire the same lock, exactly one must win. Any other result
+// means two schedulers end up running for one config, and every task fires
+// twice.
+func TestConcurrentAcquireHasExactlyOneWinner(t *testing.T) {
+	dir := t.TempDir()
+	const n = 16
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var winners []*Lock
+	var errs []error
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				winners = append(winners, l)
+			} else {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, l := range winners {
+		defer l.Release()
+	}
+
+	if len(winners) != 1 {
+		t.Fatalf("got %d winners out of %d concurrent acquires, want exactly 1 "+
+			"(multiple winners means every task fires twice)", len(winners), n)
+	}
+	if len(errs) != n-1 {
+		t.Errorf("got %d losers, want %d", len(errs), n-1)
+	}
+}
+
+// TestConcurrentAcquireBreaksStaleDeadPidLockOnce is the regression test for
+// the stale-lock TOCTOU race: when a pre-seeded lock names a dead pid,
+// multiple goroutines that all observe the same stale file must not all be
+// able to remove it and retry. Before the rename-based claim, the first
+// remover's retry-link could win while a second remover deleted that
+// winner's brand new, live lock and then won its own retry-link too - two
+// schedulers ending up running for one config, with every task firing
+// twice. Looped, since the original bug's failure rate was only about 9%.
+func TestConcurrentAcquireBreaksStaleDeadPidLockOnce(t *testing.T) {
+	const n = 16
+	const iterations = 100
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := cmd.Process.Pid
+	body := `{"pid": ` + strconv.Itoa(deadPID) +
+		`, "started_at": "2026-07-29T14:00:00Z", "config_path": "/proj/.coucou.yaml"}`
+
+	for iter := 0; iter < iterations; iter++ {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var winners []*Lock
+
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+				if err == nil {
+					mu.Lock()
+					winners = append(winners, l)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("iteration %d: got %d winners out of %d concurrent acquires "+
+				"of a dead-pid stale lock, want exactly 1 (multiple winners means "+
+				"two schedulers and every task firing twice)", iter, len(winners), n)
+		}
+		for _, l := range winners {
+			l.Release()
+		}
+	}
+}
+
+// TestConcurrentAcquireBreaksCorruptLockOnce is the same regression test as
+// TestConcurrentAcquireBreaksStaleDeadPidLockOnce, but for an unparseable
+// (corrupt) pre-seeded lock file rather than a dead-pid one, since the two
+// take different paths to being classified as stale.
+func TestConcurrentAcquireBreaksCorruptLockOnce(t *testing.T) {
+	const n = 16
+	const iterations = 100
+
+	for iter := 0; iter < iterations; iter++ {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "lock"), []byte("garbage"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var winners []*Lock
+
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+				if err == nil {
+					mu.Lock()
+					winners = append(winners, l)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("iteration %d: got %d winners out of %d concurrent acquires "+
+				"of a corrupt stale lock, want exactly 1 (multiple winners means "+
+				"two schedulers and every task firing twice)", iter, len(winners), n)
+		}
+		for _, l := range winners {
+			l.Release()
+		}
+	}
+}
+
+// TestConcurrentAcquireLeavesNoStrayStaleOrTempFiles guards the rename-based
+// stale-lock claim added to fix the TOCTOU race: the ".stale.<token>"
+// staging path used while claiming a stale lock, and the ".tmp.<token>"
+// staging path used while writing a new one, must never accumulate in the
+// state directory even under heavy concurrent contention.
+func TestConcurrentAcquireLeavesNoStrayStaleOrTempFiles(t *testing.T) {
+	const n = 16
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := cmd.Process.Pid
+	body := `{"pid": ` + strconv.Itoa(deadPID) +
+		`, "started_at": "2026-07-29T14:00:00Z", "config_path": "/proj/.coucou.yaml"}`
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+			if err == nil {
+				l.Release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".stale.") || strings.Contains(e.Name(), ".tmp.") {
+			t.Errorf("stray staging file left behind: %s", e.Name())
+		}
+	}
+}
+
+// TestAcquireLeavesNoStrayTempFiles guards the temp-file-then-link mechanics
+// added by the atomicity fix: the ".tmp.<token>" file used to stage the
+// payload before linking it into place must never accumulate in the state
+// directory, whether the acquire succeeds, fails, or is followed by Release.
+func TestAcquireLeavesNoStrayTempFiles(t *testing.T) {
+	noStrayTemps := func(t *testing.T, dir string) {
+		t.Helper()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".tmp.") {
+				t.Errorf("stray temp file left behind: %s", e.Name())
+			}
+		}
+	}
+
+	t.Run("after successful acquire", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Release()
+		noStrayTemps(t, dir)
+	})
+
+	t.Run("after failed acquire", func(t *testing.T) {
+		dir := t.TempDir()
+		first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.Release()
+
+		if _, err := AcquireLock(dir, "/proj/.coucou.yaml", false); err == nil {
+			t.Fatal("expected the second acquisition to fail")
+		}
+		noStrayTemps(t, dir)
+	})
+
+	t.Run("after release", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Release(); err != nil {
+			t.Fatal(err)
+		}
+		noStrayTemps(t, dir)
+	})
+}
