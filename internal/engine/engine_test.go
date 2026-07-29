@@ -385,6 +385,202 @@ func TestBackwardClockStepRecomputes(t *testing.T) {
 	}
 }
 
+// TestIntervalMissedRunsReportDoesNotLoopBack is the regression test for the
+// finding that @every's Next ignores now when prev is non-zero: rescheduling
+// with the stale prev left next_at in the past, so report silently behaved
+// like catch_up on the very next tick.
+func TestIntervalMissedRunsReportDoesNotLoopBack(t *testing.T) {
+	last := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC) // 24h ago
+	now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{
+		Name: "poll", Command: "true", Schedule: "@every 30m",
+		MissedRuns: config.MissedReport,
+	})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+	st.Get("poll").LastRun = &state.LastRun{FinishedAt: last, Outcome: "ok"}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+	e.Tick()
+	e.Wait()
+
+	if fr.callCount() != 0 {
+		t.Errorf("report ran %d times, want 0", fr.callCount())
+	}
+	if !e.Overdue("poll") {
+		t.Error("report should mark the interval task overdue")
+	}
+	if next := e.NextAt("poll"); !next.After(now) {
+		t.Errorf("NextAt = %v, want strictly after now (%v)", next, now)
+	}
+}
+
+func TestIntervalMissedRunsIgnoreDoesNotLoopBack(t *testing.T) {
+	last := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC) // 24h ago
+	now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{
+		Name: "poll", Command: "true", Schedule: "@every 30m",
+		MissedRuns: config.MissedIgnore,
+	})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+	st.Get("poll").LastRun = &state.LastRun{FinishedAt: last, Outcome: "ok"}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+	e.Tick()
+	e.Wait()
+
+	if fr.callCount() != 0 {
+		t.Errorf("ignore ran %d times, want 0", fr.callCount())
+	}
+	if e.Overdue("poll") {
+		t.Error("ignore should not mark the task overdue")
+	}
+	if next := e.NextAt("poll"); !next.After(now) {
+		t.Errorf("NextAt = %v, want strictly after now (%v)", next, now)
+	}
+}
+
+func TestIntervalMissedRunsCatchUpStillRunsExactlyOnce(t *testing.T) {
+	last := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC) // 24h ago
+	now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{
+		Name: "poll", Command: "true", Schedule: "@every 30m",
+		MissedRuns: config.MissedCatchUp,
+	})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+	st.Get("poll").LastRun = &state.LastRun{FinishedAt: last, Outcome: "ok"}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+	e.Tick()
+	e.Wait()
+
+	if fr.callCount() != 1 {
+		t.Errorf("catch_up ran %d times, want exactly 1", fr.callCount())
+	}
+}
+
+// TestStopDoesNotPanicConcurrentTick is the regression test for Stop closing
+// e.events while emit could still be sending on it. Run with -race.
+func TestStopDoesNotPanicConcurrentTick(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{Name: "x", Command: "true", Schedule: "* * * * *"})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+
+	// Drain events so emit's non-blocking send has somewhere to go.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for range e.Events() {
+		}
+	}()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				clk.Advance(time.Second)
+				e.Tick()
+			}
+		}
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	e.Stop()
+	close(stop)
+	wg.Wait()
+	<-drainDone
+}
+
+// TestCatchUpIsStaggered is the regression test for spec section 2.5:
+// several overdue catch_up tasks in one pass must not stampede at once.
+func TestCatchUpIsStaggered(t *testing.T) {
+	last := time.Date(2026, 7, 28, 17, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t,
+		config.Task{Name: "a", Command: "true", Schedule: "0 17 * * *", MissedRuns: config.MissedCatchUp},
+		config.Task{Name: "b", Command: "true", Schedule: "0 17 * * *", MissedRuns: config.MissedCatchUp},
+		config.Task{Name: "c", Command: "true", Schedule: "0 17 * * *", MissedRuns: config.MissedCatchUp},
+	)
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+	for _, name := range []string{"a", "b", "c"} {
+		st.Get(name).LastRun = &state.LastRun{FinishedAt: last, Outcome: "ok"}
+	}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+	e.Tick()
+	e.Wait()
+
+	if got := fr.callCount(); got != 1 {
+		t.Fatalf("ran %d times on the first tick, want exactly 1", got)
+	}
+
+	fr.mu.Lock()
+	ranImmediately := fr.calls[0]
+	fr.mu.Unlock()
+
+	// The two tasks that did NOT run immediately must be staggered into the
+	// near future, spaced roughly 2s apart, rather than left due right now.
+	var future []time.Time
+	for _, name := range []string{"a", "b", "c"} {
+		if name == ranImmediately {
+			continue
+		}
+		future = append(future, e.NextAt(name))
+	}
+	if len(future) != 2 {
+		t.Fatalf("expected 2 staggered tasks, got %d", len(future))
+	}
+	if future[0].Equal(future[1]) {
+		t.Error("staggered tasks should not share the same next_at")
+	}
+	for _, next := range future {
+		if !next.After(now) {
+			t.Errorf("staggered next_at %v should be after now %v", next, now)
+		}
+		if next.Before(now.Add(1 * time.Second)) {
+			t.Errorf("staggered next_at %v too close to now %v", next, now)
+		}
+		if next.After(now.Add(10 * time.Second)) {
+			t.Errorf("staggered next_at %v too far from now %v", next, now)
+		}
+	}
+
+	// Advancing past the stagger window lets the rest run.
+	clk.Advance(10 * time.Second)
+	e.Tick()
+	e.Wait()
+
+	if got := fr.callCount(); got != 3 {
+		t.Errorf("after advancing past the stagger window, ran %d times, want 3", got)
+	}
+}
+
 func TestEventsAreEmitted(t *testing.T) {
 	now := time.Date(2026, 7, 29, 16, 59, 0, 0, time.UTC)
 	clk := clock.NewFake(now)

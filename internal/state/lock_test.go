@@ -174,6 +174,36 @@ func TestReleaseOrdinaryPathRemovesFile(t *testing.T) {
 	}
 }
 
+// TestAcquireRetryDoesNotStompLiveLock guards the O_EXCL retry path added to
+// fix the TOCTOU race: an exclusive create that loses to a file already on
+// disk must inspect that file's liveness before ever removing it. A live
+// holder must still cause a non-force acquire to fail, exactly as before.
+func TestAcquireRetryDoesNotStompLiveLock(t *testing.T) {
+	dir := t.TempDir()
+	first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+
+	_, err = AcquireLock(dir, "/proj/.coucou.yaml", false)
+	if err == nil {
+		t.Fatal("expected the second acquisition to fail")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(os.Getpid())) {
+		t.Errorf("error %q should name the holding pid", err)
+	}
+
+	// The live lock must still be intact and owned by the first holder.
+	onDisk, ok := readLock(filepath.Join(dir, "lock"))
+	if !ok {
+		t.Fatal("lock file should still be readable")
+	}
+	if onDisk.token != first.token {
+		t.Error("a failed non-force acquire must not disturb the live lock")
+	}
+}
+
 func TestAcquireLockGeneratesDistinctTokens(t *testing.T) {
 	dir1, dir2 := t.TempDir(), t.TempDir()
 

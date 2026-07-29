@@ -71,21 +71,66 @@ func newToken() (string, error) {
 
 // AcquireLock claims the lock in dir. It fails if a live process holds it,
 // unless force is set. A lock whose pid is dead is broken automatically.
+//
+// Creation of the lock file uses O_EXCL so two processes racing to acquire
+// the same lock at the same instant cannot both win: only one of them can
+// win the exclusive create. The read-then-write shape this replaced was
+// time-of-check-to-time-of-use, allowing exactly that double-firing this
+// lock exists to prevent.
 func AcquireLock(dir, configPath string, force bool) (*Lock, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create state directory %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, lockName)
 
-	if existing, ok := readLock(path); ok && !force && processAlive(existing.PID) {
-		return nil, fmt.Errorf(
-			"coucou is already running for this config (pid %d, since %s)\n"+
-				"Use --force to take over.",
-			existing.PID, existing.StartedAt.Format("15:04"))
+	// One retry: if the exclusive create loses the race to a file that
+	// turns out to be stale (dead pid, unparseable, or force), remove it
+	// and try exactly once more. If that second attempt also collides,
+	// someone else won the race in the meantime and the correct outcome is
+	// to report "already running" rather than loop.
+	for attempt := 0; attempt < 2; attempt++ {
+		l, err := tryAcquire(path, configPath)
+		if err == nil {
+			return l, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+
+		existing, ok := readLock(path)
+		if ok && !force && processAlive(existing.PID) {
+			return nil, fmt.Errorf(
+				"coucou is already running for this config (pid %d, since %s)\n"+
+					"Use --force to take over.",
+				existing.PID, existing.StartedAt.Format("15:04"))
+		}
+
+		// Dead pid, unparseable file, or force: the lock is stale (or being
+		// forcibly taken over). Remove it and retry the exclusive create.
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("cannot remove stale lock %s: %w", path, err)
+		}
 	}
+
+	return nil, fmt.Errorf(
+		"coucou is already running for this config; another process won the race to acquire the lock %s",
+		path)
+}
+
+// tryAcquire attempts the atomic, exclusive creation of the lock file. On
+// success it writes the lock payload and returns the new Lock. On failure it
+// returns the raw os error from OpenFile unwrapped, so callers can test it
+// with os.IsExist.
+func tryAcquire(path, configPath string) (*Lock, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 
 	token, err := newToken()
 	if err != nil {
+		os.Remove(path)
 		return nil, err
 	}
 
@@ -98,9 +143,11 @@ func AcquireLock(dir, configPath string, force bool) (*Lock, error) {
 	}
 	data, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
+		os.Remove(path)
 		return nil, err
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		os.Remove(path)
 		return nil, fmt.Errorf("cannot write lock %s: %w", path, err)
 	}
 	return l, nil

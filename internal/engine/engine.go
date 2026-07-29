@@ -41,6 +41,19 @@ type taskRuntime struct {
 	running bool
 	cancel  context.CancelFunc
 	queued  bool // on_overlap: queue, depth 1
+
+	// staggering is true while a catch_up task has been pushed into the
+	// near future by applyMissedPolicies's stampede stagger, and has not
+	// yet actually dispatched. It stops isMissedLocked's signal 2 (which is
+	// based on a stale last-finish time that stagger deliberately does not
+	// update) from re-flagging the task as newly missed on every
+	// subsequent applyMissedPolicies pass -- Start and Tick both call it,
+	// and each call's local stagger counter starts over at zero, so
+	// without this guard a still-pending staggered task would be
+	// rediscovered as "first in this pass" and dispatched immediately,
+	// defeating the stagger. The ordinary due-time check in Tick's main
+	// loop is what actually dispatches it once nextAt arrives.
+	staggering bool
 }
 
 // Engine owns scheduling. It has no terminal dependency and communicates
@@ -54,6 +67,7 @@ type Engine struct {
 	mu       sync.Mutex
 	rt       map[string]*taskRuntime
 	lastTick time.Time
+	stopped  bool
 
 	events chan Event
 	wg     sync.WaitGroup
@@ -131,12 +145,18 @@ func (e *Engine) Tick() {
 // startup, after a suspend, or after a clock step. It is deliberately not
 // startup-only.
 func (e *Engine) applyMissedPolicies(now time.Time) {
+	// catchUpStagger spaces overdue catch_up dispatches apart so several
+	// overdue tasks don't stampede at once (spec section 2.5). The first
+	// overdue catch_up task in a pass still runs immediately.
+	const catchUpStagger = 2 * time.Second
+	staggered := 0
+
 	for i := range e.cfg.Tasks {
 		t := &e.cfg.Tasks[i]
 
 		e.mu.Lock()
 		rt := e.rt[t.Name]
-		if rt == nil || rt.running || e.state.Get(t.Name).Disabled {
+		if rt == nil || rt.running || rt.staggering || e.state.Get(t.Name).Disabled {
 			e.mu.Unlock()
 			continue
 		}
@@ -153,7 +173,15 @@ func (e *Engine) applyMissedPolicies(now time.Time) {
 
 		switch t.MissedRuns {
 		case config.MissedCatchUp:
-			e.dispatch(t, now)
+			if staggered == 0 {
+				e.dispatch(t, now)
+			} else {
+				e.mu.Lock()
+				rt.nextAt = now.Add(time.Duration(staggered) * catchUpStagger)
+				rt.staggering = true
+				e.mu.Unlock()
+			}
+			staggered++
 		case config.MissedReport:
 			e.mu.Lock()
 			rt.overdue = true
@@ -249,6 +277,7 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 	}
 	rt.running = true
 	rt.overdue = false
+	rt.staggering = false
 	rt.cancel = cancel
 	e.scheduleNextLocked(t, now)
 	e.mu.Unlock()
@@ -311,7 +340,16 @@ func (e *Engine) scheduleNextLocked(t *config.Task, now time.Time) {
 	if ls := e.state.Get(t.Name).LastRun; ls != nil {
 		prev = ls.FinishedAt
 	}
-	rt.nextAt = t.Parsed.Next(prev, now)
+	next := t.Parsed.Next(prev, now)
+	// Next must always land strictly after now. An interval anchored on a
+	// stale prev (e.g. a last run long ago) would otherwise stay in the
+	// past forever, making report/ignore behave like catch_up: the very
+	// next tick would see it as due again. Re-anchor on now itself when
+	// that happens; cron is unaffected since it already ignores prev.
+	if !next.After(now) {
+		next = t.Parsed.Next(now, now)
+	}
+	rt.nextAt = next
 }
 
 func (e *Engine) saveState() {
@@ -320,6 +358,11 @@ func (e *Engine) saveState() {
 }
 
 func (e *Engine) emit(ev Event) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopped {
+		return
+	}
 	select {
 	case e.events <- ev:
 	default: // never block scheduling on a slow subscriber
@@ -355,7 +398,10 @@ func (e *Engine) Overdue(name string) bool {
 // Wait blocks until no run is in flight.
 func (e *Engine) Wait() { e.wg.Wait() }
 
-// Stop cancels every running task and closes the event channel.
+// Stop cancels every running task and closes the event channel. It is safe
+// to call concurrently with Tick: emit holds e.mu across every send, and
+// Stop closes the channel under the same lock after every run has finished,
+// so a close and a send can never race.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	for _, rt := range e.rt {
@@ -365,5 +411,8 @@ func (e *Engine) Stop() {
 	}
 	e.mu.Unlock()
 	e.wg.Wait()
+	e.mu.Lock()
+	e.stopped = true
 	close(e.events)
+	e.mu.Unlock()
 }
