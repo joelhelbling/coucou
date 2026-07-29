@@ -39,7 +39,7 @@ func Parse(expr string) (Schedule, error) {
 		return parseInterval(trimmed)
 	}
 
-	if cronExpr, isMacro, err := expandMacro(trimmed); isMacro {
+	if cronExpr, human, isMacro, err := expandMacro(trimmed); isMacro {
 		if err != nil {
 			return nil, err
 		}
@@ -47,7 +47,7 @@ func Parse(expr string) (Schedule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%q expanded to %q: %w", trimmed, cronExpr, err)
 		}
-		return &cronSchedule{spec: spec, source: trimmed}, nil
+		return &cronSchedule{spec: spec, source: trimmed, human: human}, nil
 	}
 
 	spec, err := ParseCron(trimmed)
@@ -75,6 +75,10 @@ func parseInterval(expr string) (Schedule, error) {
 type cronSchedule struct {
 	spec   *CronSpec
 	source string
+	// human is the description carried from macro-expansion time. It is
+	// empty for raw cron, since raw cron has no parsed "intent" beyond the
+	// expression itself.
+	human string
 }
 
 func (c *cronSchedule) Next(_ time.Time, now time.Time) time.Time { return c.spec.Next(now) }
@@ -82,26 +86,13 @@ func (c *cronSchedule) Kind() Kind                                { return KindC
 func (c *cronSchedule) String() string                            { return c.source }
 
 func (c *cronSchedule) Human() string {
-	// Describe the expanded spec by sampling it: this keeps the description
-	// honest for both raw cron and macros without a second grammar.
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	first := c.spec.Next(base)
-	if first.IsZero() {
-		return c.source
+	// Macros carry their description from parse time, since they know their
+	// own meaning. Raw cron has no macro intent to describe, so it is
+	// returned verbatim rather than guessed at by sampling Next().
+	if c.human != "" {
+		return c.human
 	}
-	second := c.spec.Next(first)
-
-	timeOfDay := first.Format("15:04")
-	switch {
-	case !second.IsZero() && second.Sub(first) == 24*time.Hour:
-		return fmt.Sprintf("at %s every day", timeOfDay)
-	case !second.IsZero() && second.Sub(first) == 7*24*time.Hour:
-		return fmt.Sprintf("at %s every %s", timeOfDay, first.Weekday())
-	case !second.IsZero() && second.Sub(first) == time.Hour:
-		return fmt.Sprintf("at :%02d every hour", first.Minute())
-	default:
-		return c.source
-	}
+	return c.source
 }
 
 type intervalSchedule struct {

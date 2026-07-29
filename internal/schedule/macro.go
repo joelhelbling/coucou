@@ -6,20 +6,27 @@ import (
 	"strings"
 )
 
+// weekdayNames gives the full English weekday name for a cron dow value
+// (0-6, Sunday = 0), matching the dayNames map in cron.go.
+var weekdayNames = [...]string{
+	"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+}
+
 // expandMacro converts a macro expression such as "@weekly on mon at 18:30"
-// into the equivalent five-field cron expression. It returns ok=false when
-// expr is not a macro at all, so the caller can try other forms.
-func expandMacro(expr string) (cron string, ok bool, err error) {
+// into the equivalent five-field cron expression, along with a human-readable
+// description of that same intent. It returns ok=false when expr is not a
+// macro at all, so the caller can try other forms.
+func expandMacro(expr string) (cron string, human string, ok bool, err error) {
 	fields := strings.Fields(expr)
 	if len(fields) == 0 || !strings.HasPrefix(fields[0], "@") {
-		return "", false, nil
+		return "", "", false, nil
 	}
 
 	macro := strings.ToLower(fields[0])
 	switch macro {
 	case "@hourly", "@daily", "@weekly", "@monthly":
 	default:
-		return "", true, fmt.Errorf("unknown macro %q "+
+		return "", "", true, fmt.Errorf("unknown macro %q "+
 			"(expected @hourly, @daily, @weekly, @monthly or @every)", macro)
 	}
 
@@ -29,16 +36,16 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 		switch strings.ToLower(rest[0]) {
 		case "on":
 			if len(rest) < 2 {
-				return "", true, fmt.Errorf("%q: 'on' needs a value", expr)
+				return "", "", true, fmt.Errorf("%q: 'on' needs a value", expr)
 			}
 			onArg, rest = rest[1], rest[2:]
 		case "at":
 			if len(rest) < 2 {
-				return "", true, fmt.Errorf("%q: 'at' needs a value", expr)
+				return "", "", true, fmt.Errorf("%q: 'at' needs a value", expr)
 			}
 			atArg, rest = rest[1], rest[2:]
 		default:
-			return "", true, fmt.Errorf("%q: unexpected %q "+
+			return "", "", true, fmt.Errorf("%q: unexpected %q "+
 				"(expected 'on' or 'at')", expr, rest[0])
 		}
 	}
@@ -49,35 +56,39 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 	switch macro {
 	case "@hourly":
 		if onArg != "" {
-			return "", true, fmt.Errorf("@hourly does not take 'on'")
+			return "", "", true, fmt.Errorf("@hourly does not take 'on'")
 		}
 		if atArg != "" {
 			m, err := parseMinuteOfHour(atArg)
 			if err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 			minute = m
 		}
-		return fmt.Sprintf("%d * * * *", minute), true, nil
+		cron := fmt.Sprintf("%d * * * *", minute)
+		human := fmt.Sprintf("at :%02d every hour", minute)
+		return cron, human, true, nil
 
 	case "@daily":
 		if onArg != "" {
-			return "", true, fmt.Errorf("@daily does not take 'on'")
+			return "", "", true, fmt.Errorf("@daily does not take 'on'")
 		}
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d * * *", minute, hour), true, nil
+		cron := fmt.Sprintf("%d %d * * *", minute, hour)
+		human := fmt.Sprintf("at %02d:%02d every day", hour, minute)
+		return cron, human, true, nil
 
 	case "@weekly":
 		dow := 0 // Sunday
 		if onArg != "" {
 			d, ok := dayNames[strings.ToLower(onArg)]
 			if !ok {
-				return "", true, fmt.Errorf("%q is not a day name "+
+				return "", "", true, fmt.Errorf("%q is not a day name "+
 					"(expected sun, mon, tue, wed, thu, fri or sat)", onArg)
 			}
 			dow = d
@@ -85,29 +96,33 @@ func expandMacro(expr string) (cron string, ok bool, err error) {
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d * * %d", minute, hour, dow), true, nil
+		cron := fmt.Sprintf("%d %d * * %d", minute, hour, dow)
+		human := fmt.Sprintf("at %02d:%02d every %s", hour, minute, weekdayNames[dow])
+		return cron, human, true, nil
 
 	case "@monthly":
 		dom := 1
 		if onArg != "" {
 			d, err := strconv.Atoi(onArg)
 			if err != nil || d < 1 || d > 31 {
-				return "", true, fmt.Errorf("%q is not a day of month 1-31", onArg)
+				return "", "", true, fmt.Errorf("%q is not a day of month 1-31", onArg)
 			}
 			dom = d
 		}
 		if atArg != "" {
 			var err error
 			if hour, minute, err = parseTimeOfDay(atArg); err != nil {
-				return "", true, err
+				return "", "", true, err
 			}
 		}
-		return fmt.Sprintf("%d %d %d * *", minute, hour, dom), true, nil
+		cron := fmt.Sprintf("%d %d %d * *", minute, hour, dom)
+		human := fmt.Sprintf("at %02d:%02d on day %d of every month", hour, minute, dom)
+		return cron, human, true, nil
 	}
-	return "", true, fmt.Errorf("unhandled macro %q", macro)
+	return "", "", true, fmt.Errorf("unhandled macro %q", macro)
 }
 
 // parseTimeOfDay parses "17:00".

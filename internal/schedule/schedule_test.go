@@ -1,7 +1,6 @@
 package schedule
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -99,19 +98,25 @@ func TestParseErrors(t *testing.T) {
 }
 
 func TestHuman(t *testing.T) {
-	tests := []struct{ expr, contains string }{
-		{"@daily at 17:00", "17:00"},
-		{"@weekly on mon at 18:30", "Monday"},
-		{"@every 90s", "1m30s"},
+	tests := []struct{ expr, want string }{
+		{"@weekly on mon at 18:30", "at 18:30 every Monday"},
+		{"@daily at 17:00", "at 17:00 every day"},
+		{"@daily", "at 00:00 every day"},
+		{"@hourly at :15", "at :15 every hour"},
+		{"@hourly", "at :00 every hour"},
+		{"@monthly on 1 at 09:00", "at 09:00 on day 1 of every month"},
+		{"@weekly", "at 00:00 every Sunday"},
+		{"@every 90s", "every 1m30s"},
+		{"30 18 * * 1", "30 18 * * 1"},
+		{"0 9 * * 1-5", "0 9 * * 1-5"},
 	}
 	for _, tc := range tests {
 		s, err := Parse(tc.expr)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", tc.expr, err)
 		}
-		if !strings.Contains(s.Human(), tc.contains) {
-			t.Errorf("Human() for %q = %q, want it to contain %q",
-				tc.expr, s.Human(), tc.contains)
+		if got := s.Human(); got != tc.want {
+			t.Errorf("Human() for %q = %q, want %q", tc.expr, got, tc.want)
 		}
 	}
 }
