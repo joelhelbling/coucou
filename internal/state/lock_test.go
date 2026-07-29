@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -225,4 +226,106 @@ func TestAcquireLockGeneratesDistinctTokens(t *testing.T) {
 	if l1.token == l2.token {
 		t.Error("two AcquireLock calls should produce different tokens")
 	}
+}
+
+// TestConcurrentAcquireHasExactlyOneWinner is the regression test for the
+// atomicity fix: AcquireLock must never let the lock file be observable in a
+// half-written state. Under the old O_CREATE|O_EXCL approach, a losing
+// acquirer could open the winner's file before its payload was written,
+// find it empty and therefore unparseable, and conclude it was stale -
+// deleting the winner's live lock and taking over itself. With N goroutines
+// racing to acquire the same lock, exactly one must win. Any other result
+// means two schedulers end up running for one config, and every task fires
+// twice.
+func TestConcurrentAcquireHasExactlyOneWinner(t *testing.T) {
+	dir := t.TempDir()
+	const n = 16
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var winners []*Lock
+	var errs []error
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				winners = append(winners, l)
+			} else {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, l := range winners {
+		defer l.Release()
+	}
+
+	if len(winners) != 1 {
+		t.Fatalf("got %d winners out of %d concurrent acquires, want exactly 1 "+
+			"(multiple winners means every task fires twice)", len(winners), n)
+	}
+	if len(errs) != n-1 {
+		t.Errorf("got %d losers, want %d", len(errs), n-1)
+	}
+}
+
+// TestAcquireLeavesNoStrayTempFiles guards the temp-file-then-link mechanics
+// added by the atomicity fix: the ".tmp.<token>" file used to stage the
+// payload before linking it into place must never accumulate in the state
+// directory, whether the acquire succeeds, fails, or is followed by Release.
+func TestAcquireLeavesNoStrayTempFiles(t *testing.T) {
+	noStrayTemps := func(t *testing.T, dir string) {
+		t.Helper()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".tmp.") {
+				t.Errorf("stray temp file left behind: %s", e.Name())
+			}
+		}
+	}
+
+	t.Run("after successful acquire", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Release()
+		noStrayTemps(t, dir)
+	})
+
+	t.Run("after failed acquire", func(t *testing.T) {
+		dir := t.TempDir()
+		first, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.Release()
+
+		if _, err := AcquireLock(dir, "/proj/.coucou.yaml", false); err == nil {
+			t.Fatal("expected the second acquisition to fail")
+		}
+		noStrayTemps(t, dir)
+	})
+
+	t.Run("after release", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Release(); err != nil {
+			t.Fatal(err)
+		}
+		noStrayTemps(t, dir)
+	})
 }

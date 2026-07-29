@@ -72,9 +72,10 @@ func newToken() (string, error) {
 // AcquireLock claims the lock in dir. It fails if a live process holds it,
 // unless force is set. A lock whose pid is dead is broken automatically.
 //
-// Creation of the lock file uses O_EXCL so two processes racing to acquire
-// the same lock at the same instant cannot both win: only one of them can
-// win the exclusive create. The read-then-write shape this replaced was
+// The lock file is put in place with os.Link from a fully-written temp file,
+// so two processes racing to acquire the same lock at the same instant
+// cannot both win, and the file is never visible half-written: only one of
+// them can win the atomic link. The read-then-write shape this replaced was
 // time-of-check-to-time-of-use, allowing exactly that double-firing this
 // lock exists to prevent.
 func AcquireLock(dir, configPath string, force bool) (*Lock, error) {
@@ -117,20 +118,21 @@ func AcquireLock(dir, configPath string, force bool) (*Lock, error) {
 		path)
 }
 
-// tryAcquire attempts the atomic, exclusive creation of the lock file. On
-// success it writes the lock payload and returns the new Lock. On failure it
-// returns the raw os error from OpenFile unwrapped, so callers can test it
-// with os.IsExist.
+// tryAcquire claims the lock file atomically. The full JSON payload is built
+// in memory and written to a uniquely-named temp file in the same directory
+// first, then linked into place with os.Link. Link is atomic and fails with
+// EEXIST if the target already exists, so the lock file is never observable
+// in a half-written (empty or partial) state: the instant it exists, it is
+// complete. This closes the window that O_CREATE|O_EXCL left open, where a
+// second acquirer could see an empty file mid-write and misclassify it as an
+// unparseable, and therefore stale, lock.
+//
+// On any failure it returns the raw os error, so callers can test it with
+// os.IsExist. The temp file is always removed, whether the link succeeds or
+// not.
 func tryAcquire(path, configPath string) (*Lock, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
 	token, err := newToken()
 	if err != nil {
-		os.Remove(path)
 		return nil, err
 	}
 
@@ -143,12 +145,19 @@ func tryAcquire(path, configPath string) (*Lock, error) {
 	}
 	data, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
-		os.Remove(path)
 		return nil, err
 	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		os.Remove(path)
-		return nil, fmt.Errorf("cannot write lock %s: %w", path, err)
+
+	// The token is unique per acquirer, so including it in the temp file
+	// name means two concurrent acquirers can never collide on it.
+	tmpPath := path + ".tmp." + token
+	if err := os.WriteFile(tmpPath, append(data, '\n'), 0o644); err != nil {
+		return nil, fmt.Errorf("cannot write lock temp file %s: %w", tmpPath, err)
+	}
+	defer os.Remove(tmpPath)
+
+	if err := os.Link(tmpPath, path); err != nil {
+		return nil, err
 	}
 	return l, nil
 }
