@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,8 +45,12 @@ type Runner interface {
 type runner struct {
 	grace time.Duration
 	// stream, when set, receives output instead of the task's log file.
-	// "coucou run" uses it so a manual run streams to the terminal.
-	stream *os.File
+	// "coucou run" uses it so a manual run streams to the terminal. It is an
+	// io.Writer, not an *os.File, both so callers can pass any writer (a
+	// bytes.Buffer in tests, a CLI-injected stdout) and structurally, since
+	// io.Writer has no Close: a caller-owned stream can never be closed by
+	// mistake.
+	stream io.Writer
 }
 
 // New returns a Runner that waits grace between SIGTERM and SIGKILL and
@@ -58,8 +63,9 @@ func New(grace time.Duration) Runner {
 }
 
 // NewStreaming returns a Runner that sends output to out rather than to the
-// task's log file.
-func NewStreaming(grace time.Duration, out *os.File) Runner {
+// task's log file. out may be any io.Writer (os.Stdout, a bytes.Buffer in
+// tests, or a CLI-injected writer); it is never closed.
+func NewStreaming(grace time.Duration, out io.Writer) Runner {
 	if grace <= 0 {
 		grace = DefaultGrace
 	}
@@ -69,7 +75,7 @@ func NewStreaming(grace time.Duration, out *os.File) Runner {
 func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Result {
 	res := Result{StartedAt: time.Now()}
 
-	out, err := r.openOutput(cfg, t)
+	out, closer, err := r.openOutput(cfg, t)
 	if err != nil {
 		res.FinishedAt = time.Now()
 		res.Outcome = OutcomeFail
@@ -77,9 +83,11 @@ func (r *runner) Run(ctx context.Context, cfg *config.Config, t *config.Task) Re
 		res.Err = err
 		return res
 	}
-	// Never close a caller-owned stream such as os.Stdout.
-	if r.stream == nil {
-		defer out.Close()
+	// closer is only set for the log-file / devnull paths that this
+	// function opened itself. A caller-owned stream (r.stream) has no
+	// Close to call, so there is nothing to leak.
+	if closer != nil {
+		defer closer.Close()
 	}
 
 	cmd := exec.Command(t.Shell, "-c", t.Command)
@@ -182,28 +190,31 @@ func exitCode(err error) int {
 	return -1
 }
 
-// openOutput returns the destination for stdout and stderr. With no log
-// configured both go to /dev/null: they must never be inherited, because a
-// child writing to the TUI's terminal would corrupt the display.
-func (r *runner) openOutput(cfg *config.Config, t *config.Task) (*os.File, error) {
+// openOutput returns the destination for stdout and stderr, plus a closer
+// when this function opened the underlying file itself (log file or
+// /dev/null). With no log configured both go to /dev/null: they must never
+// be inherited, because a child writing to the TUI's terminal would corrupt
+// the display. When r.stream is set, the returned closer is nil: the
+// caller-owned writer is never closed here.
+func (r *runner) openOutput(cfg *config.Config, t *config.Task) (io.Writer, io.Closer, error) {
 	if r.stream != nil {
-		return r.stream, nil
+		return r.stream, nil, nil
 	}
 	path := cfg.LogPath(t)
 	if path == "" {
 		f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 		if err != nil {
-			return nil, fmt.Errorf("cannot open %s: %w", os.DevNull, err)
+			return nil, nil, fmt.Errorf("cannot open %s: %w", os.DevNull, err)
 		}
-		return f, nil
+		return f, f, nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("cannot create log directory for %s: %w", path, err)
+		return nil, nil, fmt.Errorf("cannot create log directory for %s: %w", path, err)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open log %s: %w", path, err)
+		return nil, nil, fmt.Errorf("cannot open log %s: %w", path, err)
 	}
-	return f, nil
+	return f, f, nil
 }

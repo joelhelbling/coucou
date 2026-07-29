@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -208,5 +209,24 @@ func TestRunUsesConfigDirAsWorkingDirectory(t *testing.T) {
 	// macOS reports /private/var/... for /var/..., so compare the base name.
 	if !strings.Contains(string(body), filepath.Base(cfg.Dir)) {
 		t.Errorf("pwd = %q, want it inside %q", strings.TrimSpace(string(body)), cfg.Dir)
+	}
+}
+
+// TestNewStreamingWritesToArbitraryWriter is a regression test for a bug
+// where NewStreaming took a *os.File, so callers had nothing to pass but a
+// real file (e.g. os.Stdout) and could never capture output in a test or
+// redirect it to any other io.Writer. NewStreaming must accept any
+// io.Writer, such as a bytes.Buffer.
+func TestNewStreamingWritesToArbitraryWriter(t *testing.T) {
+	cfg, task := fixture(t, config.Task{Name: "stream", Command: "echo hello-stream"})
+
+	var buf bytes.Buffer
+	res := NewStreaming(DefaultGrace, &buf).Run(context.Background(), cfg, task)
+
+	if res.Outcome != OutcomeOK {
+		t.Fatalf("Outcome = %q, err %v", res.Outcome, res.Err)
+	}
+	if !strings.Contains(buf.String(), "hello-stream") {
+		t.Errorf("buffer = %q, want it to contain command output", buf.String())
 	}
 }

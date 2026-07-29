@@ -207,3 +207,62 @@ func TestUnknownSubcommand(t *testing.T) {
 		t.Errorf("stderr should name the unknown subcommand:\n%s", errOut)
 	}
 }
+
+// TestRunCapturesInjectedStdout is a regression test for a bug where
+// runOne hardcoded os.Stdout instead of using the stdout writer Run was
+// given, so a task's own output — the whole point of "coucou run" — could
+// never be captured by a caller. The 14 original tests all missed this
+// because they only assert side effects (a file written, an exit code),
+// never the captured output of "run" itself.
+func TestRunCapturesInjectedStdout(t *testing.T) {
+	dir := project(t, `
+tasks:
+  - name: echoer
+    command: "echo marker-xyz-123"
+    schedule: "@daily"
+`)
+	code, out, errOut := run(t, dir, "run", "echoer")
+	if code != 0 {
+		t.Fatalf("exit %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(out, "marker-xyz-123") {
+		t.Errorf("captured stdout missing task output:\n%s", out)
+	}
+}
+
+func TestFlagAfterSubcommandIsAnError(t *testing.T) {
+	dir := project(t, goodConfig)
+	code, _, errOut := run(t, dir, "list", "--config", "/tmp/other.yaml")
+	if code == 0 {
+		t.Fatal("exit 0, want non-zero")
+	}
+	if !strings.Contains(errOut, "--config") || !strings.Contains(errOut, "list") {
+		t.Errorf("stderr should name both the flag and the subcommand:\n%s", errOut)
+	}
+}
+
+func TestFlagAfterRunSubcommandIsAnError(t *testing.T) {
+	dir := project(t, goodConfig)
+	code, _, errOut := run(t, dir, "run", "xkcd", "--force")
+	if code == 0 {
+		t.Fatal("exit 0, want non-zero")
+	}
+	if !strings.Contains(errOut, "--force") {
+		t.Errorf("stderr should name the offending flag:\n%s", errOut)
+	}
+}
+
+func TestFlagBeforeSubcommandStillWorks(t *testing.T) {
+	dir := project(t, goodConfig)
+	other := filepath.Join(t.TempDir(), "other.yaml")
+	if err := os.WriteFile(other, []byte("tasks: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := run(t, dir, "--config", other, "list")
+	if code != 0 {
+		t.Fatalf("exit %d (stderr: %s)", code, errOut)
+	}
+	if strings.Contains(out, "xkcd") {
+		t.Error("--config before the subcommand should still be honored")
+	}
+}

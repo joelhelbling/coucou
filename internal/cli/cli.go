@@ -70,6 +70,19 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 		return 2
 	}
 
+	// Go's flag package stops parsing at the first non-flag token, so a flag
+	// placed after the subcommand (e.g. "coucou list --config x") lands here
+	// unconsumed instead of being rejected or applied. Silently ignoring it
+	// would mean the wrong config gets loaded with no warning, so any
+	// remaining token that looks like a flag is a hard error.
+	for _, a := range rest {
+		if len(a) > 1 && a[0] == '-' {
+			fmt.Fprintf(stderr, "unknown argument %q after subcommand %q\n", a, command)
+			fmt.Fprintf(stderr, "Flags must come before the subcommand: coucou --config PATH %s\n", command)
+			return 2
+		}
+	}
+
 	path, err := config.Discover(cwd, *configPath, os.Getenv("COUCOU_CONFIG"))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -154,9 +167,12 @@ func runOne(cfg *config.Config, name string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Stream to the terminal rather than to the task's log file: this is a
-	// manual test run, not an occurrence of the schedule.
-	res := runner.NewStreaming(runner.DefaultGrace, os.Stdout).
+	// Stream to the caller-provided stdout rather than to the task's log
+	// file: this is a manual test run, not an occurrence of the schedule.
+	// Using the injected writer (rather than os.Stdout directly) is what
+	// makes "coucou run" testable and keeps Run's output fully captured by
+	// its caller.
+	res := runner.NewStreaming(runner.DefaultGrace, stdout).
 		Run(context.Background(), cfg, task)
 	if res.Err != nil {
 		fmt.Fprintln(stderr, res.Err)
