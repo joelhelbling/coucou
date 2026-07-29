@@ -128,12 +128,21 @@ func TestRunTimesOutAndKillsStubbornChild(t *testing.T) {
 func TestRunKillsGrandchildren(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "marker")
-	// The shell backgrounds a grandchild that would write the marker after a
-	// delay. Killing only the direct child would leave it alive to write.
+	// The shell backgrounds a grandchild that sleeps briefly and then writes
+	// the marker. Killing only the direct child (the process-group leader)
+	// would leave this grandchild orphaned but still running, so it would
+	// still write the marker after its sleep elapses.
+	//
+	// Timing must make a surviving grandchild's marker write observable
+	// within the window this test actually checks: the grandchild's sleep
+	// (300ms) MUST stay shorter than the post-run wait below (1.5s), or an
+	// orphaned grandchild would still be sleeping when we check for the
+	// marker and the test would pass regardless of whether the whole group
+	// was killed — silently testing nothing.
 	cfg := &config.Config{Dir: dir, Tasks: []config.Task{{
 		Name:    "family",
 		Shell:   "/bin/sh",
-		Command: "sh -c 'sleep 30; echo alive > " + marker + "' & wait",
+		Command: "sh -c 'sleep 0.3; echo alive > " + marker + "' & wait",
 		Timeout: config.Duration(200 * time.Millisecond),
 	}}}
 	task := &cfg.Tasks[0]
@@ -143,10 +152,45 @@ func TestRunKillsGrandchildren(t *testing.T) {
 		t.Fatalf("Outcome = %q, want timeout", res.Outcome)
 	}
 
-	// Give any survivor time to write its marker.
-	time.Sleep(500 * time.Millisecond)
+	// Give any survivor time to finish its 300ms sleep and write its marker.
+	time.Sleep(1500 * time.Millisecond)
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("grandchild survived; the whole process group must be killed")
+	}
+}
+
+func TestRunContextCancelReplacesAndKillsProcess(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	cfg := &config.Config{Dir: dir, Tasks: []config.Task{{
+		Name:    "long",
+		Shell:   "/bin/sh",
+		Command: "sleep 30; echo alive > " + marker,
+	}}}
+	task := &cfg.Tasks[0]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	res := New(300*time.Millisecond).Run(ctx, cfg, task)
+	elapsed := time.Since(start)
+
+	if res.Outcome != OutcomeReplaced {
+		t.Errorf("Outcome = %q, want replaced", res.Outcome)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %v; cancellation did not terminate the process promptly", elapsed)
+	}
+
+	// Give any survivor time to write its marker; a correctly killed process
+	// never reaches the "sleep 30" command's completion.
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("process survived context cancellation; it must be killed")
 	}
 }
 
