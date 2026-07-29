@@ -9,3 +9,6 @@
 
 # macOS
 .DS_Store
+
+# Subagent-driven-development scratch workspace
+.superpowers/
