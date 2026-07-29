@@ -275,6 +275,149 @@ func TestConcurrentAcquireHasExactlyOneWinner(t *testing.T) {
 	}
 }
 
+// TestConcurrentAcquireBreaksStaleDeadPidLockOnce is the regression test for
+// the stale-lock TOCTOU race: when a pre-seeded lock names a dead pid,
+// multiple goroutines that all observe the same stale file must not all be
+// able to remove it and retry. Before the rename-based claim, the first
+// remover's retry-link could win while a second remover deleted that
+// winner's brand new, live lock and then won its own retry-link too - two
+// schedulers ending up running for one config, with every task firing
+// twice. Looped, since the original bug's failure rate was only about 9%.
+func TestConcurrentAcquireBreaksStaleDeadPidLockOnce(t *testing.T) {
+	const n = 16
+	const iterations = 100
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := cmd.Process.Pid
+	body := `{"pid": ` + strconv.Itoa(deadPID) +
+		`, "started_at": "2026-07-29T14:00:00Z", "config_path": "/proj/.coucou.yaml"}`
+
+	for iter := 0; iter < iterations; iter++ {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var winners []*Lock
+
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+				if err == nil {
+					mu.Lock()
+					winners = append(winners, l)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("iteration %d: got %d winners out of %d concurrent acquires "+
+				"of a dead-pid stale lock, want exactly 1 (multiple winners means "+
+				"two schedulers and every task firing twice)", iter, len(winners), n)
+		}
+		for _, l := range winners {
+			l.Release()
+		}
+	}
+}
+
+// TestConcurrentAcquireBreaksCorruptLockOnce is the same regression test as
+// TestConcurrentAcquireBreaksStaleDeadPidLockOnce, but for an unparseable
+// (corrupt) pre-seeded lock file rather than a dead-pid one, since the two
+// take different paths to being classified as stale.
+func TestConcurrentAcquireBreaksCorruptLockOnce(t *testing.T) {
+	const n = 16
+	const iterations = 100
+
+	for iter := 0; iter < iterations; iter++ {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "lock"), []byte("garbage"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var winners []*Lock
+
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+				if err == nil {
+					mu.Lock()
+					winners = append(winners, l)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("iteration %d: got %d winners out of %d concurrent acquires "+
+				"of a corrupt stale lock, want exactly 1 (multiple winners means "+
+				"two schedulers and every task firing twice)", iter, len(winners), n)
+		}
+		for _, l := range winners {
+			l.Release()
+		}
+	}
+}
+
+// TestConcurrentAcquireLeavesNoStrayStaleOrTempFiles guards the rename-based
+// stale-lock claim added to fix the TOCTOU race: the ".stale.<token>"
+// staging path used while claiming a stale lock, and the ".tmp.<token>"
+// staging path used while writing a new one, must never accumulate in the
+// state directory even under heavy concurrent contention.
+func TestConcurrentAcquireLeavesNoStrayStaleOrTempFiles(t *testing.T) {
+	const n = 16
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := cmd.Process.Pid
+	body := `{"pid": ` + strconv.Itoa(deadPID) +
+		`, "started_at": "2026-07-29T14:00:00Z", "config_path": "/proj/.coucou.yaml"}`
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := AcquireLock(dir, "/proj/.coucou.yaml", false)
+			if err == nil {
+				l.Release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".stale.") || strings.Contains(e.Name(), ".tmp.") {
+			t.Errorf("stray staging file left behind: %s", e.Name())
+		}
+	}
+}
+
 // TestAcquireLeavesNoStrayTempFiles guards the temp-file-then-link mechanics
 // added by the atomicity fix: the ".tmp.<token>" file used to stage the
 // payload before linking it into place must never accumulate in the state
