@@ -23,16 +23,22 @@ func Discover(cwd, flagPath, envPath string) (string, error) {
 		if explicit.path == "" {
 			continue
 		}
-		if _, err := os.Stat(explicit.path); err != nil {
+		info, err := os.Stat(explicit.path)
+		if err != nil {
 			return "", fmt.Errorf("%s: cannot read %s: %w",
 				explicit.source, explicit.path, err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("%s: %s is a directory, not a config file",
+				explicit.source, explicit.path)
 		}
 		return explicit.path, nil
 	}
 
 	for _, name := range DefaultNames {
 		candidate := filepath.Join(cwd, name)
-		if _, err := os.Stat(candidate); err == nil {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
 			return candidate, nil
 		}
 	}

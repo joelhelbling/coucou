@@ -83,3 +83,59 @@ func TestDiscoverMissingFlagFileIsAnError(t *testing.T) {
 		t.Fatal("expected an error for a --config path that does not exist")
 	}
 }
+
+func TestDiscoverDirectoryInCwdWithYmlFallback(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".coucou.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yml := touch(t, dir, ".coucou.yml")
+	got, err := Discover(dir, "", "")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if got != yml {
+		t.Errorf("got %q, want %q (should skip directory and use .yml)", got, yml)
+	}
+}
+
+func TestDiscoverDirectoryInCwdWithNoFallback(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".coucou.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Discover(dir, "", "")
+	if err == nil {
+		t.Fatal("expected an error when only a directory named .coucou.yaml exists")
+	}
+	if !strings.Contains(err.Error(), dir) {
+		t.Errorf("error %q should name the directory searched (%s)", err, dir)
+	}
+}
+
+func TestDiscoverFlagPointingAtDirectory(t *testing.T) {
+	dir := t.TempDir()
+	dirPath := filepath.Join(dir, "somedir")
+	if err := os.Mkdir(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Discover(dir, dirPath, "")
+	if err == nil {
+		t.Fatal("expected an error when --config points at a directory")
+	}
+	if !strings.Contains(err.Error(), "--config") {
+		t.Errorf("error %q should mention --config", err)
+	}
+}
+
+func TestDiscoverMissingEnvPathDoesNotFallback(t *testing.T) {
+	dir := t.TempDir()
+	touch(t, dir, ".coucou.yaml")
+	_, err := Discover(dir, "", filepath.Join(dir, "nope.yaml"))
+	if err == nil {
+		t.Fatal("expected an error when $COUCOU_CONFIG points to a non-existent file")
+	}
+	if !strings.Contains(err.Error(), "$COUCOU_CONFIG") {
+		t.Errorf("error %q should mention $COUCOU_CONFIG", err)
+	}
+}
