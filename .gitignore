@@ -12,3 +12,6 @@
 
 # Subagent-driven-development scratch workspace
 .superpowers/
+
+# GoReleaser output
+/dist/
