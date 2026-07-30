@@ -104,6 +104,24 @@ Status  Idle
 `L` hands the `log:` file to `$PAGER` and restores the TUI when you quit it.
 Coucou never reads, parses, or renders command output itself.
 
+## Installing
+
+```sh
+brew install joelhelbling/tap/coucou
+```
+
+Or build from source. Development uses [Task](https://taskfile.dev) and
+[mise](https://mise.jdx.dev); `mise install` picks up both Task and the Go
+version pinned in `.go-version`.
+
+```sh
+task build      # compile ./coucou
+task install    # go install into $GOBIN
+task check      # build, test, vet, gofmt — the same gates CI runs
+task clean      # remove build artifacts
+task --list     # everything else
+```
+
 ## How it's configured
 
 Coucou reads `.coucou.yaml` from the **current directory**. It does not search

@@ -14,8 +14,9 @@ import (
 	"github.com/joelhelbling/coucou/internal/runner"
 )
 
-// Version is the build version.
-const Version = "0.1.0-dev"
+// Version is the build version. Release builds override it via
+// -ldflags "-X github.com/joelhelbling/coucou/internal/cli.Version=..."
+var Version = "0.1.0-dev"
 
 const usage = `coucou - a project-scoped TUI task scheduler
 

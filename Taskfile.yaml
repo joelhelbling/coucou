@@ -1,0 +1,77 @@
+version: '3'
+
+vars:
+  BINARY: coucou
+  VERSION_PKG: github.com/joelhelbling/coucou/internal/cli
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Compile the coucou binary into the repo root
+    cmds:
+      - go build -ldflags "-X {{.VERSION_PKG}}.Version=dev" -o {{.BINARY}} .
+    sources:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+    generates:
+      - '{{.BINARY}}'
+
+  test:
+    desc: Run the full Go test suite
+    cmds:
+      - go test ./...
+
+  fmt:
+    desc: Format all Go source
+    cmds:
+      - gofmt -w .
+
+  check:
+    desc: Run the same gates CI runs (build, test, vet, gofmt)
+    cmds:
+      - go build ./...
+      - go test ./...
+      - go vet ./...
+      - |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "Unformatted files:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+  install:
+    desc: Build and install coucou into $GOBIN (or ~/go/bin)
+    cmds:
+      - go install -ldflags "-X {{.VERSION_PKG}}.Version=dev" .
+
+  release-snapshot:
+    desc: Build all release artifacts locally without publishing (validates goreleaser)
+    cmds:
+      - goreleaser release --snapshot --clean
+
+  release:
+    desc: "Tag and push a release, which publishes to the Homebrew tap (usage: task release VERSION=v0.1.0)"
+    preconditions:
+      - sh: '[ -n "{{.VERSION}}" ]'
+        msg: "VERSION is required, e.g. task release VERSION=v0.1.0"
+      - sh: '[ -z "$(git status --porcelain)" ]'
+        msg: "working tree is dirty; commit or stash first"
+    cmds:
+      - task: check
+      - git tag -a {{.VERSION}} -m "Release {{.VERSION}}"
+      - git push origin {{.VERSION}}
+      - echo "Pushed {{.VERSION}} - watch the release at https://github.com/joelhelbling/coucou/actions"
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -f {{.BINARY}}
+      - rm -f *.test
+      - rm -rf dist

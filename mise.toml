@@ -1,0 +1,7 @@
+[tools]
+"aqua:go-task/task" = "latest"
+# Go version is sourced from .go-version (the single source of truth, also read by
+# CI's setup-go via go-version-file). Enabled below via idiomatic version files.
+
+[settings]
+idiomatic_version_file_enable_tools = ["go"]
