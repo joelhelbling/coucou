@@ -823,7 +823,11 @@ Append to `internal/supervisor/supervisor_test.go`:
 
 ```go
 func TestObserveFiresBeforeFirstTick(t *testing.T) {
-	clk := clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC))
+	// One minute before the fire time: engine.Start computes next_at with
+	// schedule.Next, which is strictly-after, so a clock already sitting on
+	// 17:00 would schedule tomorrow and the task would never run — leaving
+	// the order slice with only "observe" and failing the length check.
+	clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
 	fr := &fakeRunner{}
 	cfg := newCfg(t, config.Task{
 		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
@@ -867,6 +871,7 @@ func TestObserveFiresBeforeFirstTick(t *testing.T) {
 		t.Error("observe fired before engine.Start computed next_at")
 	}
 
+	clk.Advance(time.Minute) // now 17:00 — the task is due
 	ticks <- time.Time{}
 	ticks <- time.Time{}
 	cancel()
