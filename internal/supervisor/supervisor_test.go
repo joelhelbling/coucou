@@ -275,3 +275,92 @@ func TestCancelledBeforeStartTakesNoLock(t *testing.T) {
 		t.Error("took a lock despite being cancelled before start")
 	}
 }
+
+func TestCancelTerminatesInFlightRun(t *testing.T) {
+	// Started a minute before the due time: engine.Start computes next_at
+	// strictly after "now" and never treats a task that has never run as
+	// already overdue, so starting the fake clock exactly on the due
+	// instant would push next_at to the following day and the task would
+	// never dispatch. Advancing to the due instant afterward, as
+	// TestTickDrivesRuns does, is what actually triggers it.
+	clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
+	// block is never closed: the only way this run ends is ctx cancellation.
+	fr := &fakeRunner{block: make(chan struct{})}
+	cfg := newCfg(t, config.Task{
+		Name: "slow", Command: "sleep 999", Schedule: "0 17 * * *",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg, Clock: clk, Runner: fr, Ticks: ticks,
+		}, nil)
+	}()
+
+	ticks <- time.Time{} // not due yet
+	clk.Advance(time.Minute)
+	ticks <- time.Time{} // due now, dispatches
+	ticks <- time.Time{} // accepted only after the previous Tick returned
+
+	// Wait for the run to actually be inside fakeRunner.Run.
+	deadline := time.Now().Add(2 * time.Second)
+	for fr.callCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("run never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return; Stop is not terminating the in-flight run")
+	}
+
+	fr.mu.Lock()
+	runCtx := fr.ctxs[0]
+	fr.mu.Unlock()
+	if runCtx.Err() == nil {
+		t.Error("the run's context was not cancelled")
+	}
+}
+
+func TestClosedTickChannelExitsCleanly(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(context.Background(), Options{
+			Config: cfg,
+			Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+			Runner: &fakeRunner{},
+			Ticks:  ticks,
+		}, nil)
+	}()
+
+	ticks <- time.Time{}
+	close(ticks)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run spun on a closed tick channel instead of returning")
+	}
+
+	if _, err := os.Stat(filepath.Join(cfg.StateDirPath(), "lock")); !os.IsNotExist(err) {
+		t.Error("lock survived shutdown via closed tick channel")
+	}
+}
