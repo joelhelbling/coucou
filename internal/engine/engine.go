@@ -68,6 +68,12 @@ type Engine struct {
 	rt       map[string]*taskRuntime
 	lastTick time.Time
 	stopped  bool
+	// stopping is set at the top of Stop, before the mutex is released, so
+	// dispatch cannot start a new run once shutdown has begun. It is
+	// distinct from stopped, which gates emit and is set only after every
+	// run has finished; setting stopped this early would swallow the
+	// EventFinished of runs still shutting down.
+	stopping bool
 
 	events chan Event
 	wg     sync.WaitGroup
@@ -270,7 +276,13 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 
 	e.mu.Lock()
 	rt := e.rt[t.Name]
-	if rt == nil || rt.running {
+	// Both checks and the wg.Add below must happen under e.mu. Stop sets
+	// stopping under the same mutex and only then calls wg.Wait, so once
+	// stopping is observed no new run can start, and any wg.Add that beat
+	// it is already counted before Wait can see zero. Adding to the
+	// WaitGroup after unlocking would let Wait return while this run is
+	// still starting.
+	if e.stopping || rt == nil || rt.running {
 		e.mu.Unlock()
 		cancel()
 		return
@@ -280,11 +292,11 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 	rt.staggering = false
 	rt.cancel = cancel
 	e.scheduleNextLocked(t, now)
+	e.wg.Add(1)
 	e.mu.Unlock()
 
 	e.emit(Event{Kind: EventStarted, Task: t.Name})
 
-	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		defer cancel()
@@ -404,6 +416,7 @@ func (e *Engine) Wait() { e.wg.Wait() }
 // so a close and a send can never race.
 func (e *Engine) Stop() {
 	e.mu.Lock()
+	e.stopping = true
 	for _, rt := range e.rt {
 		if rt.cancel != nil {
 			rt.cancel()

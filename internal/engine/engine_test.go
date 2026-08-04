@@ -613,3 +613,42 @@ func TestEventsAreEmitted(t *testing.T) {
 		t.Errorf("events = %v, want started then finished", got)
 	}
 }
+
+// TestStopDoesNotReturnWhileARunIsStarting hammers the window between
+// dispatch releasing e.mu and dispatch calling wg.Add(1). If Stop's
+// wg.Wait() observes a zero counter inside that window it returns early,
+// and a run then starts with nothing waiting on it.
+//
+// This is probabilistic by nature. The primary signal is the race detector;
+// the callCount assertion catches the coarser "run started after Stop
+// returned" case.
+func TestStopDoesNotReturnWhileARunIsStarting(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		// Start the clock one minute BEFORE the fire time. Start computes
+		// next_at with schedule.Next, which returns the first instant
+		// strictly after now — so a clock already sitting on 17:00 would
+		// schedule tomorrow's 17:00 and the task would never be due.
+		clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
+		fr := &fakeRunner{}
+		cfg := newCfg(t, config.Task{
+			Name: "x", Command: "true", Schedule: "0 17 * * *",
+		})
+		st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+
+		e := New(cfg, st, fr, clk)
+		e.Start()
+		clk.Advance(time.Minute) // now 17:00 — the task is due
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); e.Tick() }()
+		go func() { defer wg.Done(); e.Stop() }()
+		wg.Wait()
+
+		settled := fr.callCount()
+		time.Sleep(2 * time.Millisecond)
+		if fr.callCount() != settled {
+			t.Fatalf("iteration %d: a run started after Stop returned", i)
+		}
+	}
+}
