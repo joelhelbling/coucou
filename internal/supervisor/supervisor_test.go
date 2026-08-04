@@ -2,7 +2,11 @@ package supervisor
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +15,7 @@ import (
 	"github.com/joelhelbling/coucou/internal/config"
 	"github.com/joelhelbling/coucou/internal/runner"
 	"github.com/joelhelbling/coucou/internal/schedule"
+	"github.com/joelhelbling/coucou/internal/state"
 )
 
 // fakeRunner records what it was asked to run and returns a canned result.
@@ -113,5 +118,160 @@ func TestTickDrivesRuns(t *testing.T) {
 	}
 	if fr.callCount() != 1 {
 		t.Errorf("ran %d times, want 1", fr.callCount())
+	}
+}
+
+func TestSecondInstanceIsRefused(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	dir := cfg.StateDirPath()
+
+	held, err := state.AcquireLock(dir, cfg.Path, false)
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	defer held.Release()
+
+	fr := &fakeRunner{}
+	ticks := make(chan time.Time)
+	err = Run(context.Background(), Options{
+		Config: cfg,
+		Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+		Runner: fr,
+		Ticks:  ticks,
+	}, nil)
+
+	if err == nil {
+		t.Fatal("second instance was allowed to start")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(os.Getpid())) {
+		t.Errorf("error should name the holding pid, got: %v", err)
+	}
+	if fr.callCount() != 0 {
+		t.Error("scheduled a run without holding the lock")
+	}
+}
+
+func TestStaleLockIsBroken(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	dir := cfg.StateDirPath()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// PID 0x7FFFFFFF is not a live process on any supported platform.
+	stale := `{"pid":2147483647,"started_at":"2020-01-01T00:00:00Z",` +
+		`"config_path":"` + cfg.Path + `","token":"deadbeef"}`
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg,
+			Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+			Runner: &fakeRunner{},
+			Ticks:  ticks,
+		}, nil)
+	}()
+
+	ticks <- time.Time{} // proves Run got past the lock and into the loop
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run should have broken the stale lock, got: %v", err)
+	}
+}
+
+func TestLockIsReleasedOnExit(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg,
+			Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+			Runner: &fakeRunner{},
+			Ticks:  ticks,
+		}, nil)
+	}()
+
+	ticks <- time.Time{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(cfg.StateDirPath(), "lock")); !os.IsNotExist(err) {
+		t.Error("lock file survived a clean shutdown")
+	}
+}
+
+// TestLockIsReleasedWhenStartupFails forces a failure *after* the lock is
+// taken, so the deferred Release is the only thing that can clean up. A
+// directory where state.json belongs makes os.ReadFile fail with EISDIR,
+// which state.Load surfaces rather than swallowing (it only recovers from
+// unparseable *content*).
+func TestLockIsReleasedWhenStartupFails(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	dir := cfg.StateDirPath()
+	if err := os.MkdirAll(filepath.Join(dir, "state.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRunner{}
+	err := Run(context.Background(), Options{
+		Config: cfg,
+		Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+		Runner: fr,
+		Ticks:  make(chan time.Time),
+	}, nil)
+
+	if err == nil {
+		t.Fatal("Run should have failed to load state")
+	}
+	if fr.callCount() != 0 {
+		t.Error("scheduled a run despite failing startup")
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "lock")); !os.IsNotExist(serr) {
+		t.Error("lock leaked after a failed startup")
+	}
+}
+
+func TestCancelledBeforeStartTakesNoLock(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	fr := &fakeRunner{}
+	err := Run(ctx, Options{
+		Config: cfg,
+		Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+		Runner: fr,
+		Ticks:  make(chan time.Time),
+	}, nil)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+	if fr.callCount() != 0 {
+		t.Error("ran a task despite being cancelled before start")
+	}
+	if _, serr := os.Stat(filepath.Join(cfg.StateDirPath(), "lock")); !os.IsNotExist(serr) {
+		t.Error("took a lock despite being cancelled before start")
 	}
 }
