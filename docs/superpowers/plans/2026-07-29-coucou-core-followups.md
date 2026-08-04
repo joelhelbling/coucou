@@ -75,6 +75,29 @@ lines.
 - `Engine.Stop()` has no direct test beyond the concurrency hammer.
 - No test covers the day-search loop crossing a December–January boundary
   (verified correct by hand, just untested).
-- `runner`'s timing tests use real sleeps with roughly 5x margins.
-  `TestRunKillsGrandchildren` flaked once under full-suite parallel load and
-  has been clean since, including at `-count=5`.
+- `runner`'s timing tests use real sleeps with roughly 5x margins. See the
+  section below: this is worse than "flaked once".
+
+## The runner timing tests are reliably flaky under load
+
+Reclassified 2026-08-04, during the supervisor work.
+
+`TestRunContextCancelReplacesAndKillsProcess` — and sometimes
+`TestRunKillsGrandchildren` — **fail 2 of 3 runs** under
+`go test -race ./... -count=2`. They pass 3 of 3 in isolation. This is not the
+once-observed flake recorded above; it reproduces on demand.
+
+It is pre-existing and unrelated to the supervisor. Verified by checking out
+the baseline commit `10bc4eb` in a throwaway worktree and reproducing there,
+and by `git diff 10bc4eb..HEAD -- internal/runner/` being empty across the
+whole supervisor branch.
+
+`task check` passes clean, because it runs neither `-race` nor `-count=2`.
+
+**Why this matters more than a flaky test usually does.** The supervisor
+plan's done-criteria named `go test -race ./... -count=2`, a command the
+baseline already failed — so the criterion was unmeetable from the start. A
+`-race` suite that is known-red trains everyone to stop reading it, which is
+exactly how a real race gets ignored. The margins want widening, or the
+timing tests want serializing (`-p 1`, or dropping `t.Parallel()`), before the
+next concurrency change lands.

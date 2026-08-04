@@ -15,3 +15,6 @@
 
 # GoReleaser output
 /dist/
+
+# Taskfile.dev checksum cache
+.task/

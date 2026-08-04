@@ -144,10 +144,12 @@ const tmpOrphanAge = time.Minute
 //
 // The directory is scanned rather than globbed. filepath.Glob would treat the
 // *directory* portion of its argument as a pattern too, so a config living
-// under a path containing [, * or ? would either fail with ErrBadPattern --
-// silently disabling the sweep forever -- or match siblings of the intended
-// directory. Names are matched against state.LockTempPrefix so that a rename
-// in internal/state breaks the build here instead of quietly reaping nothing.
+// under a path containing [, * or ? would silently match nothing and disable
+// the sweep forever -- a valid-but-wrong pattern like proj[1-9]*? returns zero
+// matches and a nil error, so there is nothing to log. An unterminated [ is
+// the narrower case that yields ErrBadPattern. Names are matched against
+// state.LockTempPrefix so that a rename in internal/state breaks the build
+// here instead of quietly reaping nothing.
 func sweepOrphanTemps(dir string, now time.Time) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
