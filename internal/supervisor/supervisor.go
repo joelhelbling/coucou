@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/joelhelbling/coucou/internal/clock"
@@ -36,7 +37,10 @@ type Options struct {
 // Run blocks until ctx is cancelled or Ticks closes, then shuts down and
 // returns. observe, when non-nil, is called once with the started engine
 // before the first tick, which is the window a TUI needs to subscribe to
-// Events() without missing any.
+// Events() without missing any. observe must neither block nor panic: it runs
+// on Run's own goroutine, so a blocking observe means Run never reaches its
+// select and ignores context cancellation entirely, and a panic unwinds the
+// whole session.
 //
 // Cancellation before the session starts returns ctx.Err(): nothing ran, so
 // it is an abort. Cancellation during the tick loop returns nil: that is
@@ -91,13 +95,23 @@ func Run(ctx context.Context, opts Options, observe func(*engine.Engine)) (err e
 
 	eng := engine.New(opts.Config, st, r, clk)
 	eng.Start()
-	if observe != nil {
-		observe(eng)
-	}
+	// Registered immediately after Start and before observe: Start applies
+	// the missed-run policies, so subprocesses may already be running by the
+	// time observe is called. If observe panicked with this defer registered
+	// any later, unwinding would release the lock while this process still
+	// had children running and was still writing state.json -- handing a
+	// second scheduler the same config, the exact thing the lock prevents.
+	// It is still registered *after* the lock-release defer above, so LIFO
+	// order stops the engine before the lock is released.
+	//
 	// Stop cancels every in-flight run, waits for each to record its
 	// outcome, and closes the event channel. No separate Wait is needed,
 	// and no final state.Save: the engine saves after every run.
 	defer eng.Stop()
+
+	if observe != nil {
+		observe(eng)
+	}
 
 	for {
 		select {
@@ -127,19 +141,29 @@ const tmpOrphanAge = time.Minute
 // sweepOrphanTemps removes lock temp files left behind by a killed process.
 // Failures are ignored: a stray temp file is cosmetic, and refusing to
 // schedule because of one would be worse than leaving it.
+//
+// The directory is scanned rather than globbed. filepath.Glob would treat the
+// *directory* portion of its argument as a pattern too, so a config living
+// under a path containing [, * or ? would either fail with ErrBadPattern --
+// silently disabling the sweep forever -- or match siblings of the intended
+// directory. Names are matched against state.LockTempPrefix so that a rename
+// in internal/state breaks the build here instead of quietly reaping nothing.
 func sweepOrphanTemps(dir string, now time.Time) {
-	matches, err := filepath.Glob(filepath.Join(dir, "lock.tmp.*"))
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	for _, p := range matches {
-		fi, err := os.Stat(p)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), state.LockTempPrefix) {
+			continue
+		}
+		fi, err := e.Info()
 		if err != nil {
 			continue
 		}
 		if now.Sub(fi.ModTime()) < tmpOrphanAge {
 			continue
 		}
-		os.Remove(p)
+		os.Remove(filepath.Join(dir, e.Name()))
 	}
 }

@@ -99,6 +99,23 @@ func TestFiresWhenDue(t *testing.T) {
 	}
 }
 
+// TestStopIsIdempotent guards the event channel's close. A live *Engine is
+// handed to caller-supplied code (supervisor.Run's observe), so the
+// supervisor's deferred Stop is not guaranteed to be the only one, and a
+// second close would panic and take the process down.
+func TestStopIsIdempotent(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 7, 29, 17, 0, 0, 0, time.UTC))
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+
+	e := New(cfg, st, &fakeRunner{}, clk)
+	e.Start()
+	e.Stop()
+	e.Stop() // must not panic on the already-closed event channel
+}
+
 func TestDisabledTaskNeverRuns(t *testing.T) {
 	now := time.Date(2026, 7, 29, 17, 0, 0, 0, time.UTC)
 	clk := clock.NewFake(now)

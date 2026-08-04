@@ -75,8 +75,9 @@ type Engine struct {
 	// EventFinished of runs still shutting down.
 	stopping bool
 
-	events chan Event
-	wg     sync.WaitGroup
+	events   chan Event
+	wg       sync.WaitGroup
+	stopOnce sync.Once
 }
 
 func New(cfg *config.Config, st *state.State, r runner.Runner, clk clock.Clock) *Engine {
@@ -414,7 +415,16 @@ func (e *Engine) Wait() { e.wg.Wait() }
 // to call concurrently with Tick: emit holds e.mu across every send, and
 // Stop closes the channel under the same lock after every run has finished,
 // so a close and a send can never race.
+//
+// It is also idempotent: a second call is a no-op rather than a panic on the
+// already-closed event channel. That matters because a live *Engine is handed
+// to caller-supplied code (supervisor.Run's observe), so nothing guarantees
+// the supervisor's deferred Stop is the only one.
 func (e *Engine) Stop() {
+	e.stopOnce.Do(e.stop)
+}
+
+func (e *Engine) stop() {
 	e.mu.Lock()
 	e.stopping = true
 	for _, rt := range e.rt {

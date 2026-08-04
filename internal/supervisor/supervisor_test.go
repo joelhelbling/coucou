@@ -75,6 +75,12 @@ func newCfg(t *testing.T, tasks ...config.Task) *config.Config {
 		if cfg.Tasks[i].MissedRuns == "" {
 			cfg.Tasks[i].MissedRuns = config.MissedReport
 		}
+		// config.applyDefaults never runs on a hand-built Config, and the
+		// real runner execs Shell directly with no fallback, so without this
+		// the fixture emits a Config that fails with "exec: no command".
+		if cfg.Tasks[i].Shell == "" {
+			cfg.Tasks[i].Shell = "/bin/sh"
+		}
 		parsed, err := schedule.Parse(cfg.Tasks[i].Schedule)
 		if err != nil {
 			t.Fatalf("bad schedule %q in fixture: %v", cfg.Tasks[i].Schedule, err)
@@ -217,6 +223,117 @@ func TestTickDrivesRuns(t *testing.T) {
 	}
 	if fr.callCount() != 1 {
 		t.Errorf("ran %d times, want 1", fr.callCount())
+	}
+
+	// Run deliberately performs no final state.Save, on the stated grounds
+	// that the engine saves after every run. Nothing else asserts that, so
+	// this pins it: if the per-run save is ever dropped, the session would
+	// lose its entire history on exit and only this check would notice.
+	st, err := state.Load(cfg.StateDirPath())
+	if err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	if st.Get("xkcd").LastRun == nil {
+		t.Error("the run was not durably saved; state.json has no LastRun")
+	}
+}
+
+// TestObserveSeesStartupEvents proves observe's stated purpose: a subscriber
+// that grabs Events() inside the callback does not miss events emitted from
+// the first tick onward.
+func TestObserveSeesStartupEvents(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+
+	started := make(chan string, 8)
+	subscribed := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg, Clock: clk, Runner: &fakeRunner{}, Ticks: ticks,
+		}, func(e *engine.Engine) {
+			events := e.Events()
+			// Drained on its own goroutine: the channel holds 64 events and
+			// the engine drops rather than blocks, but reading inline would
+			// block Run itself, which observe must never do.
+			go func() {
+				for ev := range events {
+					if ev.Kind == engine.EventStarted {
+						select {
+						case started <- ev.Task:
+						default:
+						}
+					}
+				}
+			}()
+			close(subscribed)
+		})
+	}()
+
+	<-subscribed
+	clk.Advance(time.Minute) // now 17:00 — due
+	ticks <- time.Time{}
+
+	select {
+	case name := <-started:
+		if name != "xkcd" {
+			t.Errorf("EventStarted for %q, want xkcd", name)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber never saw an EventStarted")
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestForceTakesOverALiveLock is the only exercise of Options.Force, the
+// branch that deliberately overrides the single-instance interlock.
+func TestForceTakesOverALiveLock(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	dir := cfg.StateDirPath()
+
+	held, err := state.AcquireLock(dir, cfg.Path, false)
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	defer held.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg,
+			Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+			Runner: &fakeRunner{},
+			Ticks:  ticks,
+			Force:  true,
+		}, nil)
+	}()
+
+	// A refused Run would have returned before ever reading a tick, so an
+	// accepted send is the proof that Force got us into the loop.
+	select {
+	case ticks <- time.Time{}:
+	case err := <-done:
+		t.Fatalf("Force did not take over the live lock: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run never reached its tick loop")
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 
@@ -526,6 +643,32 @@ func TestSweepSparesLockAndMutex(t *testing.T) {
 	}
 }
 
+// TestSweepHandlesGlobMetacharsInDirName guards the reason the sweep scans
+// the directory instead of globbing it: filepath.Glob treats the directory
+// portion as a pattern too, so an unterminated [ in a real config path
+// returned ErrBadPattern and disabled the sweep entirely.
+func TestSweepHandlesGlobMetacharsInDirName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "proj[1-9]*?")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	orphan := filepath.Join(dir, "lock.tmp.deadbeef")
+	if err := os.WriteFile(orphan, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-10 * time.Minute)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanTemps(dir, now)
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("orphan survived the sweep in a directory containing glob metacharacters")
+	}
+}
+
 func TestRunSweepsOnStartup(t *testing.T) {
 	cfg := newCfg(t, config.Task{
 		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
@@ -579,10 +722,6 @@ func TestDefaultsRunARealTask(t *testing.T) {
 		Name:     "touch",
 		Command:  "touch " + marker,
 		Schedule: "@every 1s",
-		// newCfg does not run config.applyDefaults, so Shell must be set
-		// explicitly here: this is the only test that exercises the real
-		// runner, which execs t.Shell directly with no fallback.
-		Shell: "/bin/sh",
 	})
 	cfg.Dir = dir
 	cfg.Path = filepath.Join(dir, ".coucou.yaml")
