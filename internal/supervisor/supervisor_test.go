@@ -563,3 +563,53 @@ func TestRunSweepsOnStartup(t *testing.T) {
 		t.Error("Run did not sweep the orphan on startup")
 	}
 }
+
+// TestDefaultsRunARealTask exercises the production wiring: real clock,
+// real ticker, real runner, real subprocess. Every other test injects
+// fakes, so without this nothing would catch time.NewTicker or
+// runner.New being hooked up wrong.
+func TestDefaultsRunARealTask(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uses real wall-clock time")
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "fired")
+	cfg := newCfg(t, config.Task{
+		Name:     "touch",
+		Command:  "touch " + marker,
+		Schedule: "@every 1s",
+		// newCfg does not run config.applyDefaults, so Shell must be set
+		// explicitly here: this is the only test that exercises the real
+		// runner, which execs t.Shell directly with no fallback.
+		Shell: "/bin/sh",
+	})
+	cfg.Dir = dir
+	cfg.Path = filepath.Join(dir, ".coucou.yaml")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{Config: cfg}, nil)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("task never fired with default (real) clock, ticker, and runner")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
