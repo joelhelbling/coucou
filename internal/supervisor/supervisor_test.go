@@ -13,6 +13,7 @@ import (
 
 	"github.com/joelhelbling/coucou/internal/clock"
 	"github.com/joelhelbling/coucou/internal/config"
+	"github.com/joelhelbling/coucou/internal/engine"
 	"github.com/joelhelbling/coucou/internal/runner"
 	"github.com/joelhelbling/coucou/internal/schedule"
 	"github.com/joelhelbling/coucou/internal/state"
@@ -81,6 +82,104 @@ func newCfg(t *testing.T, tasks ...config.Task) *config.Config {
 		cfg.Tasks[i].Parsed = parsed
 	}
 	return cfg
+}
+
+// recordingRunner wraps a fakeRunner to note when a run begins, so a test
+// can assert ordering against the observe callback.
+type recordingRunner struct {
+	fake  *fakeRunner
+	onRun func()
+}
+
+func (r *recordingRunner) Run(ctx context.Context, cfg *config.Config, t *config.Task) runner.Result {
+	r.onRun()
+	return r.fake.Run(ctx, cfg, t)
+}
+
+func TestObserveFiresBeforeFirstTick(t *testing.T) {
+	// One minute before the fire time: engine.Start computes next_at with
+	// schedule.Next, which is strictly-after, so a clock already sitting on
+	// 17:00 would schedule tomorrow and the task would never run — leaving
+	// the order slice with only "observe" and failing the length check.
+	clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+
+	var mu sync.Mutex
+	var order []string
+	observed := make(chan *engine.Engine, 1)
+
+	fr2 := &recordingRunner{fake: fr, onRun: func() {
+		mu.Lock()
+		order = append(order, "run")
+		mu.Unlock()
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg, Clock: clk, Runner: fr2, Ticks: ticks,
+		}, func(e *engine.Engine) {
+			mu.Lock()
+			order = append(order, "observe")
+			mu.Unlock()
+			observed <- e
+		})
+	}()
+
+	var eng *engine.Engine
+	select {
+	case eng = <-observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observe was never called")
+	}
+	if eng == nil {
+		t.Fatal("observe received a nil engine")
+	}
+	// The engine is started, so next_at is already computed.
+	if eng.NextAt("xkcd").IsZero() {
+		t.Error("observe fired before engine.Start computed next_at")
+	}
+
+	clk.Advance(time.Minute) // now 17:00 — the task is due
+	ticks <- time.Time{}
+	ticks <- time.Time{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) < 2 || order[0] != "observe" {
+		t.Errorf("order = %v, want observe first", order)
+	}
+}
+
+func TestNilObserveIsFine(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg,
+			Clock:  clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)),
+			Runner: &fakeRunner{},
+			Ticks:  ticks,
+		}, nil)
+	}()
+	ticks <- time.Time{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run with nil observe: %v", err)
+	}
 }
 
 func TestTickDrivesRuns(t *testing.T) {
