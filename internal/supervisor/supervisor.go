@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/joelhelbling/coucou/internal/clock"
@@ -65,6 +66,8 @@ func Run(ctx context.Context, opts Options, observe func(*engine.Engine)) (err e
 		return fmt.Errorf("cannot create state directory %s: %w", dir, err)
 	}
 
+	sweepOrphanTemps(dir, clk.Now())
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -109,5 +112,34 @@ func Run(ctx context.Context, opts Options, observe func(*engine.Engine)) (err e
 			}
 			eng.Tick()
 		}
+	}
+}
+
+// tmpOrphanAge is how old a lock temp file must be before the sweep will
+// remove it. AcquireLock writes lock.tmp.<token> and links it into place,
+// removing it via defer, so a temp file normally lives for microseconds and
+// only a SIGKILL in that window orphans one. Deleting a temp file belonging
+// to a live acquirer would make its os.Link fail with ENOENT, converting a
+// rare orphan into a reproducible acquisition failure. A genuine orphan
+// persists forever, so waiting a minute costs nothing.
+const tmpOrphanAge = time.Minute
+
+// sweepOrphanTemps removes lock temp files left behind by a killed process.
+// Failures are ignored: a stray temp file is cosmetic, and refusing to
+// schedule because of one would be worse than leaving it.
+func sweepOrphanTemps(dir string, now time.Time) {
+	matches, err := filepath.Glob(filepath.Join(dir, "lock.tmp.*"))
+	if err != nil {
+		return
+	}
+	for _, p := range matches {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if now.Sub(fi.ModTime()) < tmpOrphanAge {
+			continue
+		}
+		os.Remove(p)
 	}
 }

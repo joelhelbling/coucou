@@ -463,3 +463,103 @@ func TestClosedTickChannelExitsCleanly(t *testing.T) {
 		t.Error("lock survived shutdown via closed tick channel")
 	}
 }
+
+func TestSweepRemovesOldOrphanTemp(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	orphan := filepath.Join(dir, "lock.tmp.deadbeef")
+	if err := os.WriteFile(orphan, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-10 * time.Minute)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanTemps(dir, now)
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("old orphan temp file survived the sweep")
+	}
+}
+
+func TestSweepSparesFreshTemp(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	fresh := filepath.Join(dir, "lock.tmp.cafebabe")
+	if err := os.WriteFile(fresh, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recent := now.Add(-time.Second)
+	if err := os.Chtimes(fresh, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanTemps(dir, now)
+
+	if _, err := os.Stat(fresh); err != nil {
+		t.Error("sweep deleted a temp file that could belong to a live acquirer")
+	}
+}
+
+func TestSweepSparesLockAndMutex(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	old := now.Add(-10 * time.Minute)
+
+	for _, name := range []string{"lock", "lock.mutex", "state.json"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweepOrphanTemps(dir, now)
+
+	for _, name := range []string{"lock", "lock.mutex", "state.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("sweep deleted %s, which it must never touch", name)
+		}
+	}
+}
+
+func TestRunSweepsOnStartup(t *testing.T) {
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+	})
+	dir := cfg.StateDirPath()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	orphan := filepath.Join(dir, "lock.tmp.deadbeef")
+	if err := os.WriteFile(orphan, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-10 * time.Minute)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Config: cfg, Clock: clock.NewFake(now),
+			Runner: &fakeRunner{}, Ticks: ticks,
+		}, nil)
+	}()
+	ticks <- time.Time{}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("Run did not sweep the orphan on startup")
+	}
+}
