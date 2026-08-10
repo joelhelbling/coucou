@@ -82,17 +82,20 @@ lines.
 
 Reclassified 2026-08-04, during the supervisor work.
 
-`TestRunContextCancelReplacesAndKillsProcess` — and sometimes
-`TestRunKillsGrandchildren` — **fail 2 of 3 runs** under
-`go test -race ./... -count=2`. They pass 3 of 3 in isolation. This is not the
-once-observed flake recorded above; it reproduces on demand.
+`TestRunContextCancelReplacesAndKillsProcess` and `TestRunKillsGrandchildren`
+fail intermittently whenever the **full suite** runs, because Go runs packages
+in parallel and these tests depend on real elapsed time. In isolation they pass
+5 of 5; under full-suite load they fail often.
+
+The trigger is load, not `-race`. First observed 2-of-3 under
+`go test -race ./... -count=2`, but subsequently reproduced under a plain
+`go test ./... -count=1` — so no flag combination makes the suite reliable.
+`task check` therefore passes or fails by luck, not by correctness.
 
 It is pre-existing and unrelated to the supervisor. Verified by checking out
 the baseline commit `10bc4eb` in a throwaway worktree and reproducing there,
-and by `git diff 10bc4eb..HEAD -- internal/runner/` being empty across the
-whole supervisor branch.
-
-`task check` passes clean, because it runs neither `-race` nor `-count=2`.
+and by `git diff` showing `internal/runner/` untouched across the whole
+supervisor branch and its merge.
 
 **Why this matters more than a flaky test usually does.** The supervisor
 plan's done-criteria named `go test -race ./... -count=2`, a command the
