@@ -118,9 +118,17 @@ everything finished while a run is starting. That run then executes with
 nothing waiting on it and records state after shutdown. Go may also panic with
 "WaitGroup is reused before previous Wait returned".
 
-Fix: check `stopped` and call `wg.Add(1)` inside the lock, before `Unlock`.
-`Stop()` sets `stopped` under the same mutex, so once observed no new run
-starts, and any `wg.Add` that beat it is counted before `Wait` can see zero.
+Fix: call `wg.Add(1)` inside the lock, before `Unlock`, and gate `dispatch` on
+a new `stopping` flag that `Stop()` sets at the top of its first critical
+section. Once `stopping` is observed no new run starts, and any `wg.Add` that
+beat it is counted before `Wait` can see zero.
+
+The gate cannot key off the existing `stopped` field. `Stop()` sets that only
+*after* `wg.Wait()` returns, so a `stopped` check inside `dispatch` would be
+dead code during the exact window it is meant to guard. Nor can `stopped`
+simply be hoisted: `emit` returns early when it is set, so setting it before
+the wait would swallow the `EventFinished` of every run still shutting down.
+Two flags, two concerns.
 
 This was a carried finding deferred to the TUI phase. It comes forward because
 owning clean shutdown is the supervisor's entire purpose.

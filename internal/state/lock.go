@@ -20,6 +20,21 @@ const lockName = "lock"
 // state at all.
 const mutexName = "lock.mutex"
 
+// LockTempPrefix is the filename prefix of the temp files AcquireLock writes
+// before putting a lock in place. It is exported because an out-of-package
+// reaper depends on it: internal/supervisor sweeps temp files orphaned by a
+// process killed inside the write-then-link window, and a literal there would
+// silently stop matching if this prefix ever changed. Every construction site
+// below goes through lockTempPath, so the two cannot drift.
+const LockTempPrefix = lockName + ".tmp."
+
+// lockTempPath is the temp file a given acquirer writes before installing the
+// lock at path. The token is unique per acquirer, so two concurrent acquirers
+// can never collide on it.
+func lockTempPath(path, token string) string {
+	return filepath.Join(filepath.Dir(path), LockTempPrefix+token)
+}
+
 // Lock is an exclusive claim on scheduling one config. Two schedulers on one
 // config would fire every task twice, so this is a correctness guard rather
 // than a convenience.
@@ -166,7 +181,7 @@ func acquireStaleLock(dir, path, configPath string, force bool) (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
-	tmpPath := path + ".tmp." + l.token
+	tmpPath := lockTempPath(path, l.token)
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return nil, fmt.Errorf("cannot write lock temp file %s: %w", tmpPath, err)
 	}
@@ -196,9 +211,7 @@ func tryAcquire(path, configPath string) (*Lock, error) {
 		return nil, err
 	}
 
-	// The token is unique per acquirer, so including it in the temp file
-	// name means two concurrent acquirers can never collide on it.
-	tmpPath := path + ".tmp." + l.token
+	tmpPath := lockTempPath(path, l.token)
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return nil, fmt.Errorf("cannot write lock temp file %s: %w", tmpPath, err)
 	}

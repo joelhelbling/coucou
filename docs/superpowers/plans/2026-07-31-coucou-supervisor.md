@@ -50,8 +50,11 @@ Append to `internal/engine/engine_test.go`:
 // returned" case.
 func TestStopDoesNotReturnWhileARunIsStarting(t *testing.T) {
 	for i := 0; i < 200; i++ {
-		now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
-		clk := clock.NewFake(now)
+		// Start the clock one minute BEFORE the fire time. Start computes
+		// next_at with schedule.Next, which returns the first instant
+		// strictly after now — so a clock already sitting on 17:00 would
+		// schedule tomorrow's 17:00 and the task would never be due.
+		clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
 		fr := &fakeRunner{}
 		cfg := newCfg(t, config.Task{
 			Name: "x", Command: "true", Schedule: "0 17 * * *",
@@ -60,6 +63,7 @@ func TestStopDoesNotReturnWhileARunIsStarting(t *testing.T) {
 
 		e := New(cfg, st, fr, clk)
 		e.Start()
+		clk.Advance(time.Minute) // now 17:00 — the task is due
 
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -84,7 +88,53 @@ Expected: FAIL. Either a `DATA RACE` report naming `sync.WaitGroup`, a panic rea
 
 **Do not proceed until you have seen it fail.** If it passes, increase the iteration count to 1000 and re-run. A race fix nobody watched fail first is a guess. If it still passes at 1000, stop and report that — do not apply the fix and claim success.
 
-- [ ] **Step 3: Apply the fix**
+- [ ] **Step 3a: Add a `stopping` flag and set it at the top of `Stop`**
+
+Moving `wg.Add(1)` under the mutex is necessary but not sufficient. `Stop` sets
+`e.stopped` only *after* `wg.Wait()` returns, so a `stopped` check inside
+`dispatch` would be dead code during the exact window it is meant to guard: if
+`Stop` releases the mutex and `dispatch` acquires it before `Wait` runs, the run
+still starts.
+
+`stopped` cannot simply be moved earlier — `emit` returns early when it is set,
+so hoisting it would suppress the `EventFinished` of every run still shutting
+down. A separate flag keeps the two concerns apart.
+
+Add the field to the `Engine` struct in `internal/engine/engine.go` (the block
+at lines 61-74), directly below `stopped`:
+
+```go
+	stopped  bool
+	// stopping is set at the top of Stop, before the mutex is released, so
+	// dispatch cannot start a new run once shutdown has begun. It is
+	// distinct from stopped, which gates emit and is set only after every
+	// run has finished; setting stopped this early would swallow the
+	// EventFinished of runs still shutting down.
+	stopping bool
+```
+
+Then change `Stop` (lines 405-418) so the flag is set inside the first critical
+section:
+
+```go
+func (e *Engine) Stop() {
+	e.mu.Lock()
+	e.stopping = true
+	for _, rt := range e.rt {
+		if rt.cancel != nil {
+			rt.cancel()
+		}
+	}
+	e.mu.Unlock()
+	e.wg.Wait()
+	e.mu.Lock()
+	e.stopped = true
+	close(e.events)
+	e.mu.Unlock()
+}
+```
+
+- [ ] **Step 3b: Apply the `dispatch` fix**
 
 In `internal/engine/engine.go`, replace the opening of `dispatch` (currently lines 268-291):
 
@@ -96,12 +146,12 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 	e.mu.Lock()
 	rt := e.rt[t.Name]
 	// Both checks and the wg.Add below must happen under e.mu. Stop sets
-	// stopped under the same mutex and only then calls wg.Wait, so once
-	// stopped is observed no new run can start, and any wg.Add that beat
+	// stopping under the same mutex and only then calls wg.Wait, so once
+	// stopping is observed no new run can start, and any wg.Add that beat
 	// it is already counted before Wait can see zero. Adding to the
 	// WaitGroup after unlocking would let Wait return while this run is
 	// still starting.
-	if e.stopped || rt == nil || rt.running {
+	if e.stopping || rt == nil || rt.running {
 		e.mu.Unlock()
 		cancel()
 		return
@@ -131,20 +181,25 @@ Expected: PASS.
 - [ ] **Step 5: Run the whole engine suite under race**
 
 Run: `go test -race ./internal/engine/ -count=3`
-Expected: PASS. The tail of `dispatch` re-dispatches a queued run (`if queued { e.dispatch(...) }`); confirm the new `stopped` check does not break `TestOverlapQueue` or any other overlap test. If one fails, the correct resolution is that a queued re-dispatch after `Stop` should be dropped — that is the intended behavior, so update the test's expectation only if it asserted a post-Stop re-dispatch.
+Expected: PASS. The tail of `dispatch` re-dispatches a queued run (`if queued { e.dispatch(...) }`); confirm the new `stopping` check does not break `TestOverlapQueue` or any other overlap test. If one fails, the correct resolution is that a queued re-dispatch after `Stop` should be dropped — that is the intended behavior, so update the test's expectation only if it asserted a post-Stop re-dispatch.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add internal/engine/engine.go internal/engine/engine_test.go
-git commit -m "fix(engine): count a dispatched run before releasing the mutex
+git commit -m "fix(engine): refuse and count dispatches under the mutex Stop holds
 
-dispatch called wg.Add(1) after unlocking e.mu, so Stop's wg.Wait()
-could observe a zero counter and return while a run was still starting.
-That run then executed with nothing waiting on it and recorded state
-after shutdown; Go could also panic with 'WaitGroup is reused'.
+dispatch called wg.Add(1) after unlocking e.mu, so Stop's wg.Wait() could
+observe a zero counter and return while a run was still starting. That run
+then executed with nothing waiting on it and recorded state after
+shutdown; Go could also panic with 'WaitGroup is reused'.
 
-Check stopped and Add under the lock Stop uses to set it."
+Moving wg.Add under the lock is not enough on its own: Stop set stopped
+only after wg.Wait returned, so a gate on it would be dead code during
+the very window it guards. Add a separate stopping flag, set at the top
+of Stop while the mutex is still held, and check it in dispatch. stopped
+stays where it is because emit keys off it, and hoisting it would swallow
+the EventFinished of runs still shutting down."
 ```
 
 ---
@@ -768,7 +823,11 @@ Append to `internal/supervisor/supervisor_test.go`:
 
 ```go
 func TestObserveFiresBeforeFirstTick(t *testing.T) {
-	clk := clock.NewFake(time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC))
+	// One minute before the fire time: engine.Start computes next_at with
+	// schedule.Next, which is strictly-after, so a clock already sitting on
+	// 17:00 would schedule tomorrow and the task would never run — leaving
+	// the order slice with only "observe" and failing the length check.
+	clk := clock.NewFake(time.Date(2026, 7, 31, 16, 59, 0, 0, time.UTC))
 	fr := &fakeRunner{}
 	cfg := newCfg(t, config.Task{
 		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
@@ -812,6 +871,7 @@ func TestObserveFiresBeforeFirstTick(t *testing.T) {
 		t.Error("observe fired before engine.Start computed next_at")
 	}
 
+	clk.Advance(time.Minute) // now 17:00 — the task is due
 	ticks <- time.Time{}
 	ticks <- time.Time{}
 	cancel()
