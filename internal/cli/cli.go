@@ -12,6 +12,7 @@ import (
 	"github.com/joelhelbling/coucou/internal/clock"
 	"github.com/joelhelbling/coucou/internal/config"
 	"github.com/joelhelbling/coucou/internal/runner"
+	"github.com/joelhelbling/coucou/internal/tui"
 )
 
 // Version is the build version. Release builds override it via
@@ -43,8 +44,8 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 
 	configPath := fs.String("config", "", "path to the config file")
 	showVersion := fs.Bool("version", false, "print the version")
-	fs.Bool("ascii", false, "avoid box-drawing and braille glyphs")
-	fs.Bool("force", false, "break an existing instance lock")
+	ascii := fs.Bool("ascii", false, "avoid box-drawing and braille glyphs")
+	force := fs.Bool("force", false, "break an existing instance lock")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -62,10 +63,7 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 	}
 
 	switch command {
-	case "validate", "list", "next", "run":
-	case "tui":
-		fmt.Fprintln(stderr, "the TUI is not implemented yet; try 'coucou list'")
-		return 1
+	case "validate", "list", "next", "run", "tui":
 	default:
 		fmt.Fprintf(stderr, "unknown subcommand %q\n\n%s", command, usage)
 		return 2
@@ -97,6 +95,15 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 	}
 
 	switch command {
+	case "tui":
+		err := tui.Run(context.Background(), tui.Options{
+			Config: cfg, ASCII: *ascii, Force: *force,
+		}, stdout)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	case "validate":
 		fmt.Fprintf(stdout, "%s: %d task(s), no problems found\n", path, len(cfg.Tasks))
 		return 0

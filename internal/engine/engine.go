@@ -36,11 +36,12 @@ type Event struct {
 
 // taskRuntime is the engine's in-memory bookkeeping for one task.
 type taskRuntime struct {
-	nextAt  time.Time
-	overdue bool
-	running bool
-	cancel  context.CancelFunc
-	queued  bool // on_overlap: queue, depth 1
+	nextAt    time.Time
+	startedAt time.Time // when the in-flight run began; zero when not running
+	overdue   bool
+	running   bool
+	cancel    context.CancelFunc
+	queued    bool // on_overlap: queue, depth 1
 
 	// staggering is true while a catch_up task has been pushed into the
 	// near future by applyMissedPolicies's stampede stagger, and has not
@@ -289,6 +290,7 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 		return
 	}
 	rt.running = true
+	rt.startedAt = now
 	rt.overdue = false
 	rt.staggering = false
 	rt.cancel = cancel
@@ -325,6 +327,7 @@ func (e *Engine) dispatch(t *config.Task, now time.Time) {
 
 		rt := e.rt[t.Name]
 		rt.running = false
+		rt.startedAt = time.Time{}
 		rt.cancel = nil
 		// An interval anchors on the finish time, so recompute now.
 		if t.Parsed != nil && t.Parsed.Kind() == schedule.KindInterval {

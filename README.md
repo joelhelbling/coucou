@@ -32,7 +32,7 @@ Missed    catch_up
 History   ✓ ✓ ✓ ✗ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓   (oldest → newest)
 Log       log/api.log
 ────────────────────────────────────────────────────────────────────
-↑/↓ select   ⏎ run now   d disable   L log   q quit
+↑/↓ select   L log   q quit
 ```
 
 There is no drawn border: in a dedicated pane the multiplexer already draws
@@ -61,7 +61,7 @@ Next run  Jul 30 17:00   in 20h 27m
 Last run  Jul 28 17:00   exit 7   0.9s   no log
 History   ✓ ✓ ✗ ✓ · ✓ ✓ ✓
 ────────────────────────────────────────────────
-↑/↓ select   ⏎ run   d disable   q quit
+↑/↓ select   L log   q quit
 ```
 
 The spinner cycles the braille frames `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏` at about 10 frames
@@ -89,7 +89,7 @@ Status  Idle
   xkcd          ✗ fail
   fetch deps    ✓ ok
 ────────────────────────────────
-↑/↓  ⏎ run  d off  L log  q quit
+↑/↓  L  q
 ```
 
 ### The regions
@@ -102,7 +102,13 @@ Status  Idle
 - **Key hints** — what you can do to the selected task right now.
 
 `L` hands the `log:` file to `$PAGER` and restores the TUI when you quit it.
-Coucou never reads, parses, or renders command output itself.
+Coucou never reads, parses, or renders command output itself. Scheduling keeps
+running while the pager is up; only the display is suspended.
+
+Today the keys are `↑`/`↓` (or `k`/`j`) to select, `g`/`G` for first and last,
+`L` for the log, and `q` to quit. Running a task on demand and disabling one
+from the TUI are not built yet -- `coucou run NAME` covers the first from the
+shell.
 
 ## Installing
 
