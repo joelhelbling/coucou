@@ -231,6 +231,19 @@ func (e *Engine) isMissedLocked(t *config.Task, rt *taskRuntime, now, lastFinish
 		return true
 	}
 
+	// The occurrence is due right now, and signal 1 has already ruled out its
+	// being so far behind that we must have slept through it. Tick's due check
+	// -- the identical predicate -- is about to dispatch it, so it is due, not
+	// missed. Without this, signal 2 below consumes it first: a 1Hz ticker
+	// starts at an arbitrary sub-second offset, so the tick that catches an
+	// occurrence virtually always lands a fraction of a second after it, which
+	// is enough for "an occurrence lies between the last finish and now" to be
+	// true of the very occurrence about to run. report and ignore would then
+	// reschedule past it, and a task that had run once would never run again.
+	if !rt.nextAt.IsZero() && !now.Before(rt.nextAt) {
+		return false
+	}
+
 	// Signal 2: an occurrence elapsed while we were not running. A task that
 	// has never run is not overdue -- a fresh config must not fire
 	// everything the moment it is first loaded.

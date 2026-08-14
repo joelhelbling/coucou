@@ -278,6 +278,41 @@ func TestMissedRunsReportMarksOverdueWithoutRunning(t *testing.T) {
 	}
 }
 
+// A production tick almost never lands exactly on the due second: the 1Hz
+// ticker starts at an arbitrary sub-second offset, so the tick that sees an
+// occurrence come due typically arrives a fraction of a second after it.
+// The occurrence that is due RIGHT NOW must not be mistaken for one that was
+// missed -- otherwise the missed-run policy consumes it (report/ignore
+// reschedule to the next day) before the due check below can dispatch it, and
+// a task that has run once never runs again.
+func TestDueOccurrenceIsNotTreatedAsMissedWhenTheTickIsLate(t *testing.T) {
+	last := time.Date(2026, 7, 28, 17, 0, 30, 0, time.UTC)
+	now := time.Date(2026, 7, 29, 16, 59, 0, 750*int(time.Millisecond), time.UTC)
+
+	clk := clock.NewFake(now)
+	fr := &fakeRunner{}
+	cfg := newCfg(t, config.Task{
+		Name: "xkcd", Command: "true", Schedule: "0 17 * * *",
+		MissedRuns: config.MissedReport,
+	})
+	st := &state.State{Version: state.Version, Tasks: map[string]*state.TaskState{}}
+	st.Get("xkcd").LastRun = &state.LastRun{FinishedAt: last, Outcome: "ok"}
+
+	e := New(cfg, st, fr, clk)
+	e.Start()
+
+	clk.Advance(time.Minute) // now 17:00:00.750 -- due, and the tick is late
+	e.Tick()
+	e.Wait()
+
+	if fr.callCount() != 1 {
+		t.Fatalf("ran %d times, want 1", fr.callCount())
+	}
+	if e.Overdue("xkcd") {
+		t.Error("a task that just ran must not be marked overdue")
+	}
+}
+
 func TestMissedRunsIgnoreDoesNothing(t *testing.T) {
 	last := time.Date(2026, 7, 28, 17, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
