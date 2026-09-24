@@ -67,6 +67,18 @@ homebrew_casks:
       name: goreleaserbot
       email: bot@goreleaser.com
     commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
+    # Our binaries are unsigned, so macOS quarantines them on download and
+    # Gatekeeper refuses to run coucou. This strips the quarantine attribute.
+    #
+    # Homebrew 7.0.4 deprecated `postflight` in favour of `postflight_steps`,
+    # so `brew doctor` warns about the generated cask and blames our tap. We
+    # cannot fix that here: this setting supplies only the hook *body*, while
+    # the `postflight do` wrapper is hardcoded in GoReleaser's own template
+    # (internal/pipe/cask/templates/cask.rb). Tracked upstream in
+    # goreleaser/goreleaser#6870; the fix is slated for GoReleaser v2.19.
+    # Our release workflow pins `~> v2`, so the first release cut after v2.19
+    # ships will emit `postflight_steps` and the warning will clear itself.
+    # Nothing to do here until then.
     hooks:
       post:
         install: |
